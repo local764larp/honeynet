@@ -1,0 +1,82 @@
+[Unit]
+Description=Honeynet sensor
+Documentation=https://github.com/honeynet/docs/superpowers/specs
+After=network-online.target nftables.service
+Wants=network-online.target
+# Refuse to start without the egress ruleset. A sensor running with open
+# egress is the failure mode that gets a fleet terminated, so the dependency
+# is Requires, not Wants.
+Requires=nftables.service
+
+[Service]
+Type=simple
+User=honeynode
+Group=honeynode
+WorkingDirectory=/var/lib/honeynode
+
+ExecStart=/usr/local/bin/honeynode -config /etc/honeynode/config.json
+
+Restart=always
+RestartSec=5s
+
+# Bind :22, :23, :80 and :443 without running as root. This is the only
+# privilege the sensor needs and the only one it gets.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# --- containment ---
+#
+# Defence in depth behind the in-process invariant. The emulator has no
+# execution path (enforced by a CI lint over the source tree), and these
+# directives mean that even a memory-safety bug in the sensor yields a process
+# that cannot spawn anything, cannot write outside its state directory, and
+# cannot escalate.
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+
+# The spool and host keys are the only writable state.
+ReadWritePaths=/var/lib/honeynode
+
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# @privileged and @obsolete are denied wholesale; the explicit additions are
+# the process-spawning calls, which the sensor must never make even if a bug
+# somehow reached them.
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @obsolete @resources @mount @debug @swap @reboot
+SystemCallFilter=~execve execveat fork vfork clone3
+SystemCallArchitectures=native
+
+# --- resource bounds ---
+#
+# A sensor under a connection flood must degrade rather than take the host
+# down with it.
+LimitNOFILE=65536
+LimitNPROC=64
+MemoryMax=512M
+TasksMax=256
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=honeynode
+
+[Install]
+WantedBy=multi-user.target
