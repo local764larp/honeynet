@@ -1,0 +1,26 @@
+# build output
+/bin/
+/collector/target/
+/ml/.venv/
+/ml/*.egg-info/
+__pycache__/
+*.pyc
+
+# end-to-end run artifacts
+/.e2e/
+
+# sensor runtime state -- never commit these
+*.spool
+honeynode_host_key*
+/node/gen/**/*.pb.go
+
+# credentials and keys -- the CA key can mint any node identity
+*.pem
+*.key
+!deploy/**/*.example.pem
+/deploy/provision/ca/
+/deploy/provision/certs/
+
+# local config that may carry real collector addresses
+honeynode.json
+/collector/.env
