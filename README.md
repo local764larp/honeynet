@@ -14,11 +14,12 @@ Design: [`docs/superpowers/specs/2026-07-25-honeynet-design.md`](docs/superpower
 | Path | Language | What it is |
 |---|---|---|
 | `proto/` | Protobuf | The event schema. Single source of truth for all four languages. |
-| `node/` | Go | The sensor: SSH/Telnet honeypots, emulated shell, WAL spool, NATS publisher. |
-| `collector/` | Rust | Ingest, validation, normalization, Postgres and JSONL sinks. |
+| `node/` | Go | The sensor: SSH, Telnet, HTTP and RDP honeypots, emulated shell, canary tokens, WAL spool, NATS publisher. |
+| `collector/` | Rust | Ingest, validation, normalization, geo enrichment, read API, Postgres and JSONL sinks. |
 | `ml/` | Python | Feature extraction, bot/human classification, HDBSCAN clustering, ATT&CK mapping, STIX output. |
+| `dashboard/` | React | Operator console: live feed, origin map, session replay, attacker profiles, IOC feed. |
 | `deploy/` | — | nftables egress containment, systemd unit, NATS per-node permissions, cert issuance. |
-| `scripts/` | PowerShell | Build and end-to-end acceptance run. |
+| `scripts/` | PowerShell | Build, end-to-end acceptance run, and a local demo. |
 
 ## Build
 
@@ -46,6 +47,28 @@ ml/.venv/Scripts/python -m honeynet_ml.cli clusters .e2e/events.jsonl
 
 Other subcommands: `sessions` (bot/human classification), `attack` (ATT&CK
 mapping), `intel` (STIX 2.1 bundle), `report` (everything as JSON).
+
+## Run the console
+
+```bash
+powershell -ExecutionPolicy Bypass -File scripts/demo.ps1
+```
+
+Brings the whole platform up with every protocol enabled, replays attacker
+traffic, runs the profiling pipeline, and serves the operator console at
+`http://127.0.0.1:8088`.
+
+The console's signature view is **transcript replay**: sessions play back at the
+attacker's original keystroke timing, because the sensor records the gap between
+every key. A person hesitates, backspaces, pauses before `cat /etc/shadow`; a
+loader emits the identical line in one frame. Watching that difference settles
+the automation question in a way a confidence score does not.
+
+Map coordinates in a local run are synthetic — every session originates from
+127.0.0.1, which has no location — and are flagged as such through the API and
+labelled in the UI. Supply a MaxMind GeoLite2 database via `--geoip-city` for
+real locations; none is bundled, because the licence forbids redistribution and
+a stale copy is worse than none.
 
 ## Containment
 

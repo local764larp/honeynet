@@ -41,6 +41,13 @@ uv pip install -q -e ".[dev]"
 if (-not $SkipTests) { .\.venv\Scripts\python.exe -m pytest -q }
 Pop-Location
 
+Step 'operator dashboard'
+Push-Location (Join-Path $root 'dashboard')
+if (-not (Test-Path 'node_modules')) { npm install --silent }
+if (-not $SkipTests) { npx tsc --noEmit }
+npm run build --silent
+Pop-Location
+
 Write-Host "`nbuild complete" -ForegroundColor Green
 Get-ChildItem (Join-Path $root 'bin') -Filter *.exe |
     ForEach-Object { "  {0,-20} {1,10:N0} bytes" -f $_.Name, $_.Length }
