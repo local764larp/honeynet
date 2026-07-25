@@ -103,10 +103,18 @@ pub struct IngestStats {
     pub missing_events: u64,
 }
 
+/// Observer notified of every successfully stored event.
+///
+/// Used to feed the live index and the dashboard's event stream. It runs after
+/// the durable write, so a slow or panicking observer can never cost us the
+/// record of an attack.
+pub type Observer = Box<dyn Fn(&Event) + Send + Sync>;
+
 pub struct Ingestor<S: Store> {
     store: Arc<S>,
     seq: Mutex<SeqTracker>,
     stats: Mutex<IngestStats>,
+    observer: Option<Observer>,
 }
 
 impl<S: Store> Ingestor<S> {
@@ -115,7 +123,14 @@ impl<S: Store> Ingestor<S> {
             store,
             seq: Mutex::new(SeqTracker::default()),
             stats: Mutex::new(IngestStats::default()),
+            observer: None,
         }
+    }
+
+    /// Attaches an observer for stored events.
+    pub fn with_observer(mut self, observer: Observer) -> Self {
+        self.observer = Some(observer);
+        self
     }
 
     pub async fn stats(&self) -> IngestStats {
@@ -206,6 +221,10 @@ impl<S: Store> Ingestor<S> {
             kind = event.payload.kind(),
             "event stored"
         );
+
+        if let Some(observe) = &self.observer {
+            observe(&event);
+        }
         Some(event)
     }
 

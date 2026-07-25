@@ -15,12 +15,17 @@ use clap::Parser;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+mod api;
+mod geo;
+mod index;
 mod ingest;
 mod model;
 mod normalize;
 mod pb;
 mod store;
 
+use geo::GeoProvider;
+use index::LiveIndex;
 use ingest::Ingestor;
 use store::{JsonlStore, MemoryStore, PostgresStore, Store, TeeStore};
 
@@ -57,6 +62,35 @@ struct Args {
     /// Seconds between ingest statistics reports.
     #[arg(long, env = "COLLECTOR_STATS_INTERVAL", default_value_t = 60)]
     stats_interval: u64,
+
+    /// Address for the operator API. Bind to loopback and reverse-proxy it;
+    /// the API is read-only but it is not an internet-facing surface.
+    #[arg(long, env = "COLLECTOR_API_ADDR")]
+    api_addr: Option<std::net::SocketAddr>,
+
+    /// Directory of built dashboard assets to serve alongside the API.
+    #[arg(long, env = "COLLECTOR_DASHBOARD_DIR")]
+    dashboard_dir: Option<std::path::PathBuf>,
+
+    /// Report written by `honeynet-ml report --out`, polled by GET /api/profile
+    /// to attach cluster assignments to sessions.
+    #[arg(long, env = "COLLECTOR_PROFILE_PATH")]
+    profile_path: Option<std::path::PathBuf>,
+
+    /// MaxMind GeoLite2 City database. Operator-supplied; none is bundled.
+    #[arg(long, env = "COLLECTOR_GEOIP_CITY")]
+    geoip_city: Option<std::path::PathBuf>,
+
+    #[arg(long, env = "COLLECTOR_GEOIP_ASN")]
+    geoip_asn: Option<std::path::PathBuf>,
+
+    /// Fabricate coordinates for local development.
+    ///
+    /// The end-to-end harness drives every session from 127.0.0.1, which leaves
+    /// the attack map empty and untestable. Results are flagged `synthetic` all
+    /// the way through the API so they cannot be mistaken for attribution.
+    #[arg(long, env = "COLLECTOR_GEOIP_SYNTHETIC", default_value_t = false)]
+    geoip_synthetic: bool,
 
     #[arg(long, env = "COLLECTOR_LOG_FORMAT", default_value = "text")]
     log_format: String,
@@ -100,7 +134,48 @@ async fn main() -> Result<()> {
 
 async fn run<S: Store>(args: Args, store: Arc<S>) -> Result<()> {
     let client = connect_nats(&args).await?;
-    let ingestor = Arc::new(Ingestor::new(store));
+
+    let geo = if args.geoip_synthetic {
+        warn!("synthetic geo-IP enabled: map coordinates are fabricated and flagged as such");
+        GeoProvider::Synthetic
+    } else {
+        GeoProvider::maxmind(args.geoip_city.as_deref(), args.geoip_asn.as_deref())
+    };
+    info!(provider = geo.describe(), "geo enrichment");
+
+    let live = Arc::new(LiveIndex::new(geo));
+    // Capacity bounds how far a slow dashboard may lag before it starts
+    // missing events. Missing events on a live view is the right trade; the
+    // durable store is the record.
+    let (tx, _) = tokio::sync::broadcast::channel(1024);
+
+    let ingestor = {
+        let live = Arc::clone(&live);
+        let tx = tx.clone();
+        Arc::new(Ingestor::new(store).with_observer(Box::new(move |event| {
+            live.ingest(event);
+            let _ = tx.send(event.clone());
+        })))
+    };
+
+    let api_task = match args.api_addr {
+        Some(addr) => {
+            let app = api::router(
+                api::ApiState {
+                    index: Arc::clone(&live),
+                    events: tx.clone(),
+                    profile_path: args.profile_path.clone(),
+                },
+                args.dashboard_dir.clone(),
+            );
+            Some(tokio::spawn(async move {
+                if let Err(e) = api::serve(addr, app).await {
+                    error!(error = %e, "operator api stopped");
+                }
+            }))
+        }
+        None => None,
+    };
 
     let stats_task = {
         let ingestor = Arc::clone(&ingestor);
@@ -148,6 +223,9 @@ async fn run<S: Store>(args: Args, store: Arc<S>) -> Result<()> {
     }
 
     stats_task.abort();
+    if let Some(t) = api_task {
+        t.abort();
+    }
 
     let s = ingestor.stats().await;
     info!(received = s.received, stored = s.stored, "collector stopped");

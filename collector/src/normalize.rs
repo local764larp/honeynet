@@ -192,6 +192,9 @@ fn normalize_payload(body: pb::envelope::Event) -> Payload {
             body_size: v.body_size,
             decoy_profile: truncate(&v.decoy_profile, MAX_SHORT),
             response_status: v.response_status,
+            detected_attacks: string_list(v.detected_attacks),
+            form_username: truncate(&v.form_username, MAX_SHORT),
+            form_password: truncate(&v.form_password, MAX_SHORT),
         }),
 
         E::RdpConnect(v) => Payload::RdpConnect(RdpConnect {

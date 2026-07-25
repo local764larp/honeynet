@@ -180,6 +180,12 @@ pub struct HttpRequest {
     pub body_size: u64,
     pub decoy_profile: String,
     pub response_status: u32,
+    /// Exploit classes the sensor recognised, e.g. "log4shell", "sqli".
+    pub detected_attacks: Vec<String>,
+    /// Credentials submitted to a decoy login form. Held here rather than in
+    /// the header map so they inherit the same handling as SSH credentials.
+    pub form_username: String,
+    pub form_password: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
