@@ -50,6 +50,13 @@ type Config struct {
 
 	HeartbeatSec int `json:"heartbeat_sec"`
 
+	// CallbackHost is the authority embedded in canary URLs served by the HTTP
+	// decoys -- it must be an address an attacker's tooling can reach back on,
+	// so it is the sensor's public name, not its internal one. Defaults to the
+	// derived hostname, which is fine for a local run but should be set to the
+	// public address in production.
+	CallbackHost string `json:"callback_host"`
+
 	LogLevel string `json:"log_level"`
 }
 
@@ -132,6 +139,7 @@ func applyEnv(cfg *Config) {
 	str("HONEYNODE_HTTP_ADDR", &cfg.HTTPAddr)
 	str("HONEYNODE_RDP_ADDR", &cfg.RDPAddr)
 	str("HONEYNODE_HOST_KEY", &cfg.HostKeyPath)
+	str("HONEYNODE_CALLBACK_HOST", &cfg.CallbackHost)
 	str("HONEYNODE_LOG_LEVEL", &cfg.LogLevel)
 	num("HONEYNODE_MAX_SESSIONS", &cfg.MaxSessions)
 	num("HONEYNODE_MAX_SESSIONS_PER_IP", &cfg.MaxSessionsPerIP)

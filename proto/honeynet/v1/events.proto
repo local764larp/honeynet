@@ -181,6 +181,18 @@ message HttpRequest {
 
   // Status the decoy returned.
   uint32 response_status = 9;
+
+  // Exploit classes recognised in the request, e.g. "log4shell" | "sqli" |
+  // "path-traversal". Extracted at the sensor because the raw request is
+  // bulky and the classification is cheap; the collector keeps both so a rule
+  // change can be re-run against stored requests.
+  repeated string detected_attacks = 10;
+
+  // Credentials submitted to a decoy login form. Kept separate from the header
+  // map so they inherit the same handling as SSH credentials rather than
+  // sitting in a generic bag of strings.
+  string form_username = 11;
+  string form_password = 12;
 }
 
 message RdpConnect {

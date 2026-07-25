@@ -5,9 +5,12 @@
 /ml/*.egg-info/
 __pycache__/
 *.pyc
+node_modules/
+/dashboard/dist/
 
-# end-to-end run artifacts
+# end-to-end and demo run artifacts
 /.e2e/
+/.demo/
 
 # sensor runtime state -- never commit these
 *.spool

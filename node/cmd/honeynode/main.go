@@ -21,8 +21,10 @@ import (
 
 	"github.com/honeynet/node/internal/config"
 	"github.com/honeynet/node/internal/personality"
+	"github.com/honeynet/node/internal/protocols/rdp"
 	"github.com/honeynet/node/internal/protocols/sshd"
 	"github.com/honeynet/node/internal/protocols/telnet"
+	"github.com/honeynet/node/internal/protocols/web"
 	"github.com/honeynet/node/internal/session"
 	"github.com/honeynet/node/internal/spool"
 	"github.com/honeynet/node/internal/transport"
@@ -35,9 +37,10 @@ var buildVersion = "dev"
 
 func main() {
 	var (
-		configPath  = flag.String("config", "honeynode.json", "path to config file")
-		showIdent   = flag.Bool("identity", false, "print the derived machine identity and exit")
-		showVersion = flag.Bool("version", false, "print version and exit")
+		configPath   = flag.String("config", "honeynode.json", "path to config file")
+		showIdent    = flag.Bool("identity", false, "print the derived machine identity and exit")
+		showVersion  = flag.Bool("version", false, "print version and exit")
+		honeyfileDir = flag.String("honeyfiles", "", "generate canary honeyfiles into this directory and exit")
 	)
 	flag.Parse()
 
@@ -57,6 +60,14 @@ func main() {
 
 	if *showIdent {
 		printIdentity(p)
+		return
+	}
+
+	if *honeyfileDir != "" {
+		if err := generateHoneyfiles(cfg, p, *honeyfileDir); err != nil {
+			fmt.Fprintln(os.Stderr, "honeyfiles:", err)
+			os.Exit(1)
+		}
 		return
 	}
 
@@ -146,6 +157,39 @@ func run(cfg config.Config, p *personality.Personality, log *slog.Logger) error 
 		})
 	}
 
+	if cfg.HTTPAddr != "" {
+		srv := web.New(web.Config{
+			NodeID:           cfg.NodeID,
+			Addr:             cfg.HTTPAddr,
+			SessionIdle:      cfg.SessionIdleTimeout,
+			MaxSessions:      cfg.MaxSessions,
+			MaxSessionsPerIP: cfg.MaxSessionsPerIP,
+			CallbackHost:     cfg.CallbackHost,
+		}, p, sp, log, pub.Notify)
+		started++
+		g.Go(func() error {
+			if err := srv.ListenAndServe(gctx); err != nil && gctx.Err() == nil {
+				return fmt.Errorf("http listener: %w", err)
+			}
+			return nil
+		})
+	}
+
+	if cfg.RDPAddr != "" {
+		srv := rdp.New(rdp.Config{
+			NodeID:           cfg.NodeID,
+			Addr:             cfg.RDPAddr,
+			MaxSessionsPerIP: cfg.MaxSessionsPerIP,
+		}, p, sp, log, pub.Notify)
+		started++
+		g.Go(func() error {
+			if err := srv.ListenAndServe(gctx); err != nil && gctx.Err() == nil {
+				return fmt.Errorf("rdp listener: %w", err)
+			}
+			return nil
+		})
+	}
+
 	if started == 0 {
 		return fmt.Errorf("no protocol listeners configured")
 	}
@@ -212,6 +256,40 @@ func newLogger(level string) *slog.Logger {
 		lvl = slog.LevelInfo
 	}
 	return slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: lvl}))
+}
+
+// generateHoneyfiles writes the canary planting kit for this node.
+//
+// Each file embeds a callback token derived from the node seed, so a hit on the
+// sensor's canary endpoint names the exact file that was opened. The callback
+// host must be reachable from wherever the file is planted, which is why it is
+// the sensor's public address rather than its internal one.
+func generateHoneyfiles(cfg config.Config, p *personality.Personality, dir string) error {
+	host := cfg.CallbackHost
+	if host == "" {
+		host = p.Hostname
+	}
+
+	files, err := web.GenerateHoneyfiles(cfg.PersonalitySeed, host)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+
+	fmt.Printf("callback host: %s\n\n", host)
+	for _, f := range files {
+		path := dir + string(os.PathSeparator) + f.Name
+		if err := os.WriteFile(path, f.Content, 0o600); err != nil {
+			return fmt.Errorf("write %s: %w", f.Name, err)
+		}
+		fmt.Printf("  %-40s token=%s\n", f.Name, f.Token)
+		fmt.Printf("      type: %s\n", f.Type)
+		fmt.Printf("      plant: %s\n\n", f.Hint)
+	}
+	fmt.Println("A callback to any of these tokens fires a CanaryTrigger event on this node.")
+	return nil
 }
 
 // printIdentity dumps the derived machine identity. Useful when provisioning a

@@ -31,16 +31,46 @@ var forbiddenImports = map[string]string{
 	"os/user":       "leaks real host accounts into emulated responses",
 }
 
-// outboundPackages are permitted only in the transport layer, which talks to
-// the collector, and in the SSH/telnet listeners, which accept inbound
-// connections. Anywhere else, an outbound-capable import is how a sensor turns
-// into a relay or starts fetching attacker-supplied URLs.
-var outboundRestricted = map[string]bool{
-	"net/http": true,
+// outboundCalls are the ways a sensor could reach out to a third party.
+//
+// The rule targets calls rather than the net/http import, because the HTTP
+// honeypot needs net/http to *serve*. Serving is the product; dialling is the
+// hazard. A sensor that opens an outbound connection is either fetching an
+// attacker-supplied URL (design doc 4.2) or acting as a relay (4.3), and both
+// are the failure modes that get a fleet terminated.
+//
+// Keys are "package.Symbol" as written at the call site.
+var outboundCalls = map[string]string{
+	"http.Get":            "fetches a URL; sensors never retrieve attacker-supplied resources (4.2)",
+	"http.Post":           "outbound request from a sensor (4.2)",
+	"http.PostForm":       "outbound request from a sensor (4.2)",
+	"http.Head":           "outbound request from a sensor (4.2)",
+	"http.NewRequest":     "constructs an outbound request; sensors only serve (4.2)",
+	"http.ReadResponse":   "consumes an outbound response (4.2)",
+	"net.Dial":            "opens an arbitrary outbound connection (4.3)",
+	"net.DialTimeout":     "opens an arbitrary outbound connection (4.3)",
+	"net.DialUDP":         "opens an arbitrary outbound connection (4.3)",
+	"net.DialTCP":         "opens an arbitrary outbound connection (4.3)",
+	"tls.Dial":            "opens an arbitrary outbound connection (4.3)",
+	"tls.DialWithDialer":  "opens an arbitrary outbound connection (4.3)",
 }
 
-var outboundAllowedDirs = map[string]bool{
+// outboundCallAllowedDirs may dial, because reaching the collector is the one
+// legitimate outbound path a sensor has.
+var outboundCallAllowedDirs = map[string]bool{
 	"internal/transport": true,
+	// The attacker simulator is a test/corpus tool, not part of the sensor. It
+	// dials honeypots on purpose.
+	"cmd/attacksim": true,
+}
+
+// outboundIdents are the package identifiers worth inspecting for the calls
+// above. Restricting the scan to these keeps the walk cheap and avoids
+// flagging unrelated methods that happen to share a name.
+var outboundIdents = map[string]bool{
+	"http": true,
+	"net":  true,
+	"tls":  true,
 }
 
 func TestNoExecutionPath(t *testing.T) {
@@ -71,7 +101,6 @@ func TestNoExecutionPath(t *testing.T) {
 		}
 
 		rel, _ := filepath.Rel(root, path)
-		relDir := filepath.ToSlash(filepath.Dir(rel))
 
 		for _, imp := range file.Imports {
 			pkg, uerr := strconv.Unquote(imp.Path.Value)
@@ -82,12 +111,6 @@ func TestNoExecutionPath(t *testing.T) {
 			if reason, bad := forbiddenImports[pkg]; bad {
 				violations = append(violations,
 					filepath.ToSlash(rel)+" imports "+pkg+": "+reason)
-			}
-
-			if outboundRestricted[pkg] && !outboundAllowedDirs[relDir] {
-				violations = append(violations,
-					filepath.ToSlash(rel)+" imports "+pkg+
-						": outbound HTTP is restricted to the transport layer (design doc 4.2/4.3)")
 			}
 		}
 		return nil
@@ -153,6 +176,79 @@ func TestNoProcessSpawnCalls(t *testing.T) {
 			if banned[sel.Sel.Name] {
 				violations = append(violations,
 					filepath.ToSlash(rel)+" calls "+ident.Name+"."+sel.Sel.Name)
+			}
+			return true
+		})
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk node tree: %v", err)
+	}
+
+	for _, v := range violations {
+		t.Error("containment violation: " + v)
+	}
+}
+
+// TestNoOutboundConnections is the anti-relay and no-fetch invariant.
+//
+// The HTTP honeypot serves, so banning the net/http import outright would be
+// wrong. What must never happen is a sensor *dialling* something: that is
+// either fetching an attacker-supplied URL or relaying traffic on an
+// attacker's behalf, and both are how honeypot operators end up generating
+// abuse reports against themselves.
+func TestNoOutboundConnections(t *testing.T) {
+	root := nodeRoot(t)
+	fset := token.NewFileSet()
+
+	var violations []string
+
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if name := d.Name(); name == "gen" || name == "vendor" || name == ".git" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") {
+			return nil
+		}
+
+		rel, _ := filepath.Rel(root, path)
+		relDir := filepath.ToSlash(filepath.Dir(rel))
+		if outboundCallAllowedDirs[relDir] {
+			return nil
+		}
+		// Tests dial the honeypot they just started; that is the point of them.
+		if strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+
+		file, perr := parser.ParseFile(fset, path, nil, 0)
+		if perr != nil {
+			return perr
+		}
+
+		ast.Inspect(file, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			ident, ok := sel.X.(*ast.Ident)
+			if !ok || !outboundIdents[ident.Name] {
+				return true
+			}
+			key := ident.Name + "." + sel.Sel.Name
+			if reason, bad := outboundCalls[key]; bad {
+				violations = append(violations,
+					filepath.ToSlash(rel)+" calls "+key+": "+reason)
 			}
 			return true
 		})

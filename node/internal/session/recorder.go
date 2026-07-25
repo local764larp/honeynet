@@ -235,6 +235,102 @@ func (r *Recorder) Upload(ev shell.UploadEvent) {
 	})
 }
 
+// HTTPRequestEvent is one request against a web decoy.
+type HTTPRequestEvent struct {
+	Method          string
+	Path            string
+	Query           string
+	Version         string
+	Headers         map[string]string
+	BodySHA256      string
+	BodySize        uint64
+	DecoyProfile    string
+	ResponseStatus  uint32
+	DetectedAttacks []string
+	FormUsername    string
+	FormPassword    string
+}
+
+// HTTPRequest records a request against a web decoy.
+func (r *Recorder) HTTPRequest(ev HTTPRequestEvent) {
+	r.commandCount++
+	r.emit(&pb.Envelope{
+		Event: &pb.Envelope_HttpRequest{
+			HttpRequest: &pb.HttpRequest{
+				Method:          ev.Method,
+				Path:            ev.Path,
+				Query:           ev.Query,
+				Version:         ev.Version,
+				Headers:         ev.Headers,
+				BodySha256:      ev.BodySHA256,
+				BodySize:        ev.BodySize,
+				DecoyProfile:    ev.DecoyProfile,
+				ResponseStatus:  ev.ResponseStatus,
+				DetectedAttacks: ev.DetectedAttacks,
+				FormUsername:    ev.FormUsername,
+				FormPassword:    ev.FormPassword,
+			},
+		},
+	})
+}
+
+// CanaryEvent is a planted token being touched.
+type CanaryEvent struct {
+	TokenID      string
+	TokenType    string
+	PlantedPath  string
+	CallbackPeer *pb.Peer
+	UserAgent    string
+}
+
+// Canary records a canary token callback.
+//
+// The callback source frequently differs from any session peer, and that
+// difference is the interesting part: it shows the planted file left the
+// network it was planted on.
+func (r *Recorder) Canary(ev CanaryEvent) {
+	r.emit(&pb.Envelope{
+		Event: &pb.Envelope_CanaryTrigger{
+			CanaryTrigger: &pb.CanaryTrigger{
+				TokenId:      ev.TokenID,
+				TokenType:    ev.TokenType,
+				PlantedPath:  ev.PlantedPath,
+				CallbackPeer: ev.CallbackPeer,
+				UserAgent:    ev.UserAgent,
+			},
+		},
+	})
+}
+
+// RDPConnectEvent is an RDP handshake, with whatever the client disclosed
+// before the negotiation was abandoned.
+type RDPConnectEvent struct {
+	Cookie             string
+	Domain             string
+	Username           string
+	Password           string
+	ClientBuild        string
+	ClientName         string
+	RequestedProtocols []string
+}
+
+// RDPConnect records an RDP connection attempt.
+func (r *Recorder) RDPConnect(ev RDPConnectEvent) {
+	r.emit(&pb.Envelope{
+		Event: &pb.Envelope_RdpConnect{
+			RdpConnect: &pb.RdpConnect{
+				Cookie:             ev.Cookie,
+				Domain:             ev.Domain,
+				Username:           ev.Username,
+				Password:           ev.Password,
+				ClientBuild:        ev.ClientBuild,
+				ClientName:         ev.ClientName,
+				RequestedProtocols: ev.RequestedProtocols,
+			},
+		},
+	})
+}
+
 // SessionEnd closes the session record.
 func (r *Recorder) SessionEnd(reason pb.SessionEndReason, pcapSHA string) {
 	r.emit(&pb.Envelope{
