@@ -1,7 +1,7 @@
 """Attacker profiling pipeline for the honeynet deception platform."""
 
 from .corpus import Session, load_corpus, fold_sessions, load_events
-from .features import extract_behavioural, is_automated, session_summary
+from .features import classify, extract_behavioural, is_automated, session_summary
 from .cluster import cluster_sessions, cluster_stability, ClusteringResult
 from .attack import map_session, map_cluster
 
@@ -14,6 +14,7 @@ __all__ = [
     "load_events",
     "extract_behavioural",
     "is_automated",
+    "classify",
     "session_summary",
     "cluster_sessions",
     "cluster_stability",

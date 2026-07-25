@@ -229,6 +229,101 @@ def test_clustering_separates_families():
         assert len(labels) <= 1, f"{prefix} sessions split across clusters {labels}"
 
 
+def test_http_requests_become_behavioural_evidence():
+    """Web sessions must reach the classifier with evidence.
+
+    The corpus loader originally folded only `command` events, so an HTTP
+    scanner arrived with nothing to judge and fell through to "interactive" --
+    exactly backwards for the most automated traffic on the internet.
+    """
+    events = [
+        {
+            "node_id": "n1",
+            "seq": i + 1,
+            "session_id": "W1",
+            "ts_collector": "2026-07-25T10:00:00Z",
+            "payload": {
+                "kind": "http_request",
+                "method": "GET",
+                "path": path,
+                "query": "",
+                "decoy_profile": "dotenv",
+                "response_status": 200,
+                "detected_attacks": attacks,
+                "form_username": "",
+                "form_password": "",
+            },
+        }
+        for i, (path, attacks) in enumerate(
+            [("/.env", ["secret-file-probe"]), ("/wp-login.php", []), ("/", ["log4shell"])]
+        )
+    ]
+
+    s = fold_sessions(events)[0]
+    assert s.command_count == 3, "http requests should count as behavioural evidence"
+    assert "log4shell" in s.detected_attacks
+    assert "dotenv" in s.decoy_profiles
+
+    automated, confidence = is_automated(extract_behavioural(s))
+    assert automated, "a web scanner must not be classified as interactive"
+    assert confidence > 0.8
+
+
+def test_http_form_credentials_join_the_credential_corpus():
+    events = [
+        {
+            "node_id": "n1",
+            "seq": 1,
+            "session_id": "W2",
+            "ts_collector": "2026-07-25T10:00:00Z",
+            "payload": {
+                "kind": "http_request",
+                "method": "POST",
+                "path": "/phpmyadmin/index.php",
+                "decoy_profile": "phpmyadmin",
+                "response_status": 200,
+                "detected_attacks": [],
+                "form_username": "root",
+                "form_password": "toor",
+            },
+        }
+    ]
+    s = fold_sessions(events)[0]
+    assert len(s.credentials) == 1
+    assert s.credentials[0].username == "root"
+    assert s.credentials[0].password == "toor"
+    assert s.credentials[0].method == "http-form"
+
+
+def test_evidence_free_cluster_is_not_called_an_operator():
+    """A canary callback is not a person at a keyboard.
+
+    With no commands and no auth, a session cannot be shown to be automated,
+    and the automation branch would previously label the whole group
+    "interactive-operator" -- asserting a human where nothing was observed.
+    """
+    profile = summarize_cluster(0, [])
+    profile.size = 2
+    profile.automated_fraction = 0.0
+    profile.mean_command_count = 0
+    profile.top_commands = []
+    profile.protocols = ["canary"]
+    assert derive_label(profile) == "canary-callback"
+
+    profile.protocols = ["telnet"]
+    assert derive_label(profile) == "connection-probe"
+
+
+def test_exploit_attempts_name_the_cluster():
+    profile = summarize_cluster(0, [])
+    profile.size = 3
+    profile.automated_fraction = 1.0
+    profile.mean_command_count = 12
+    profile.top_commands = [("GET /.env", 3), ("GET /wp-login.php", 3)]
+    profile.detected_attacks = ["log4shell", "secret-file-probe"]
+    assert derive_label(profile) == "web-exploit-scanner"
+
+
 def test_label_reads_tools_from_raw_text():
     """Sensors record argv for the leading stage only.
 

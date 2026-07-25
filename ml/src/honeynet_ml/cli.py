@@ -5,12 +5,13 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections import Counter
 from pathlib import Path
 
 from .attack import kill_chain_order, map_cluster, map_session
 from .cluster import NOISE, cluster_sessions, cluster_stability
 from .corpus import load_corpus
-from .features import extract_behavioural, is_automated, session_summary
+from .features import classify, extract_behavioural, is_automated, session_summary
 from .intel import build_intel
 
 
@@ -150,7 +151,7 @@ def cmd_report(args: argparse.Namespace) -> int:
     result = cluster_sessions(sessions, min_cluster_size=args.min_cluster_size)
     stability = cluster_stability(sessions, windows=args.windows)
 
-    automated = sum(1 for s in sessions if is_automated(extract_behavioural(s))[0])
+    verdicts = Counter(classify(extract_behavioural(s)) for s in sessions)
 
     report = {
         "corpus": {
@@ -163,8 +164,11 @@ def cmd_report(args: argparse.Namespace) -> int:
             "distinct_hassh": len({s.hassh for s in sessions if s.hassh}),
         },
         "classification": {
-            "automated": automated,
-            "interactive": len(sessions) - automated,
+            "automated": verdicts["automated"],
+            "interactive": verdicts["interactive"],
+            # Sessions that offered nothing to judge. Counting these as
+            # interactive would overstate how many humans were observed.
+            "undetermined": verdicts["undetermined"],
         },
         "clustering": {
             "n_clusters": result.n_clusters,

@@ -81,6 +81,14 @@ class Session:
     artifacts: list[Artifact] = field(default_factory=list)
     uploads: list[dict[str, Any]] = field(default_factory=list)
 
+    #: Exploit classes the sensor recognised across this session's requests.
+    detected_attacks: list[str] = field(default_factory=list)
+    #: Web decoys the session touched, e.g. "phpmyadmin", "dotenv".
+    decoy_profiles: list[str] = field(default_factory=list)
+    #: Canary tokens opened. A non-empty list is the loudest signal the
+    #: platform produces: a planted file left the network it was planted on.
+    canary_tokens: list[str] = field(default_factory=list)
+
     started_at: datetime | None = None
     ended_at: datetime | None = None
     end_reason: str = ""
@@ -210,6 +218,55 @@ def _fold_one(session_id: str, events: list[dict[str, Any]]) -> Session:
                     index=p.get("command_index", 0),
                 )
             )
+
+        elif kind == "http_request":
+            # Folded into commands rather than kept in a parallel list.
+            #
+            # Every downstream stage -- n-gram features, volume counts, timing,
+            # clustering -- already works on commands, and a web request is the
+            # same kind of evidence: a thing the actor chose to send. Keeping
+            # them separate meant HTTP sessions arrived at the classifier with
+            # no evidence at all and fell through to "interactive", which is
+            # exactly backwards for a scanner.
+            request = f"{p.get('method', 'GET')} {p.get('path', '/')}"
+            if q := p.get("query"):
+                request += f"?{q}"
+            s.commands.append(
+                Command(
+                    raw=request,
+                    argv=[p.get("method", "GET"), p.get("path", "/")],
+                    cwd="",
+                    since_session_start_ms=0,
+                    since_previous_ms=0,
+                    # HTTP has no interactive terminal, so there is no
+                    # per-keystroke timing and the input is by definition bulk.
+                    keystroke_deltas_ms=[],
+                    bulk_input=True,
+                    index=len(s.commands),
+                )
+            )
+            for a in p.get("detected_attacks") or []:
+                if a not in s.detected_attacks:
+                    s.detected_attacks.append(a)
+            if (decoy := p.get("decoy_profile")) and decoy not in s.decoy_profiles:
+                s.decoy_profiles.append(decoy)
+
+            # Credentials submitted to a decoy login belong in the same corpus
+            # as SSH ones.
+            if p.get("form_username") or p.get("form_password"):
+                s.credentials.append(
+                    Credential(
+                        username=p.get("form_username", ""),
+                        password=p.get("form_password", ""),
+                        method="http-form",
+                        success=False,
+                        attempt_index=len(s.credentials),
+                        since_previous_ms=0,
+                    )
+                )
+
+        elif kind == "canary":
+            s.canary_tokens.append(p.get("token_id", ""))
 
         elif kind == "artifact":
             s.artifacts.append(

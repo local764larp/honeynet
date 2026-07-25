@@ -322,6 +322,20 @@ def is_automated(features: BehaviouralFeatures) -> tuple[bool, float]:
     return confidence >= 0.5, confidence
 
 
+def classify(features: BehaviouralFeatures) -> str:
+    """Three-way verdict: automated, interactive, or undetermined.
+
+    Distinct from :func:`is_automated`, which must answer with a boolean. A
+    session that offered no commands and no credentials -- a bare connection, a
+    canary callback -- supports neither verdict, and folding it into
+    "interactive" overstates how many humans were seen.
+    """
+    if features.command_count == 0 and features.auth_attempt_count <= 1:
+        return "undetermined"
+    automated, _ = is_automated(features)
+    return "automated" if automated else "interactive"
+
+
 def session_summary(session: Session) -> dict:
     """Human-readable summary used by the dashboard and the CLI report."""
     feats = extract_behavioural(session)

@@ -46,6 +46,8 @@ class ClusterProfile:
     source_ips: list[str] = field(default_factory=list)
     hasshes: list[str] = field(default_factory=list)
     banners: list[str] = field(default_factory=list)
+    protocols: list[str] = field(default_factory=list)
+    detected_attacks: list[str] = field(default_factory=list)
     top_commands: list[tuple[str, int]] = field(default_factory=list)
     top_tools: list[tuple[str, int]] = field(default_factory=list)
     artifact_hosts: list[str] = field(default_factory=list)
@@ -64,6 +66,8 @@ class ClusterProfile:
             "source_ips": self.source_ips,
             "hasshes": self.hasshes,
             "banners": self.banners,
+            "protocols": self.protocols,
+            "detected_attacks": self.detected_attacks,
             "top_commands": self.top_commands,
             "top_tools": self.top_tools,
             "artifact_hosts": self.artifact_hosts,
@@ -231,6 +235,8 @@ def summarize_cluster(cluster_id: int, members: Sequence[Session]) -> ClusterPro
         source_ips=sorted({s.src_ip for s in members if s.src_ip}),
         hasshes=sorted({s.hassh for s in members if s.hassh}),
         banners=sorted({s.client_banner for s in members if s.client_banner}),
+        protocols=sorted({s.protocol for s in members if s.protocol}),
+        detected_attacks=sorted({a for s in members for a in s.detected_attacks}),
         top_commands=cmd_counter.most_common(8),
         top_tools=tool_counter.most_common(8),
         artifact_hosts=sorted({a.host for s in members for a in s.artifacts if a.host}),
@@ -264,6 +270,24 @@ def derive_label(profile: ClusterProfile) -> str:
         t for t in ("wget", "curl", "tftp", "busybox", "chmod", "crontab", "nc")
         if re.search(rf"\b{re.escape(t)}\b", commands)
     }
+
+    # A group with no observed behaviour at all is not an operator. Canary
+    # callbacks and bare connections land here, and calling them
+    # "interactive-operator" -- which the automation branch below would do,
+    # since a no-evidence session cannot be shown to be automated -- reads as a
+    # human being at a keyboard when nothing of the sort was seen.
+    if not profile.top_commands and profile.mean_command_count == 0:
+        if profile.protocols and set(profile.protocols) == {"canary"}:
+            return "canary-callback"
+        if profile.credentials:
+            return "credential-scanner"
+        return "connection-probe"
+
+    # Recognised exploit attempts name the group regardless of cadence: a web
+    # scanner throwing Log4Shell is characterised by what it threw, not by how
+    # fast it threw it.
+    if profile.detected_attacks:
+        return "web-exploit-scanner"
 
     if profile.automated_fraction < 0.5:
         return "interactive-operator"
