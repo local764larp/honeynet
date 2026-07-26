@@ -46,12 +46,20 @@ jobs:
 
       - name: buf breaking against main
         # Skipped on main itself, where there is nothing to compare against.
+        #
+        # Also skipped while main predates the schema. This branch introduces
+        # proto/, so main currently has no .proto files and the comparison has
+        # no baseline -- buf reports that as a failure, which would be a red
+        # build for the entire life of the first pull request. Once this lands,
+        # main has the schema and the check becomes meaningful on its own.
         if: github.ref != 'refs/heads/main'
         run: |
-          if git rev-parse --verify main >/dev/null 2>&1; then
-            buf breaking --against '.git#branch=main'
-          else
+          if ! git rev-parse --verify main >/dev/null 2>&1; then
             echo "main does not exist yet; nothing to compare against"
+          elif ! git ls-tree -r --name-only main | grep -q '\.proto$'; then
+            echo "main carries no .proto files yet; no baseline to compare against"
+          else
+            buf breaking --against '.git#branch=main'
           fi
 
   go:

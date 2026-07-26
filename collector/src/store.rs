@@ -579,10 +579,11 @@ mod tests {
 
         assert_eq!(store.count().await.unwrap(), 2);
 
-        let sessions: i64 = sqlx::query_scalar("SELECT count(*) FROM sessions WHERE id = 'S-late'")
-            .fetch_one(store.pool())
-            .await
-            .unwrap();
+        let sessions: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM sessions WHERE session_id = 'S-late'")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
         assert_eq!(sessions, 1);
     }
 
