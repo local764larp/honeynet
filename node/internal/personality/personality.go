@@ -16,6 +16,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"math/rand"
 	"strings"
 	"time"
@@ -26,6 +27,20 @@ import (
 // a session transcript.
 type Personality struct {
 	Seed string
+
+	// TokenSecret keys the canary tokens planted in decoy files. Assigned
+	// after derivation from the node's private credential secret, never
+	// derived from Seed.
+	//
+	// Seed is a provisioning input and is routinely set to the node ID, which
+	// is public the moment the sensor answers a connection. Tokens derived
+	// from it could be precomputed for the whole fleet, and an attacker who
+	// did that could both recognise a planted file on sight and burn the
+	// tripwire by requesting tokens they were never given.
+	//
+	// Excluded from serialisation and from LogValue so it cannot reach a log
+	// line or the --show-ident output.
+	TokenSecret string `json:"-"`
 
 	Hostname   string
 	Distro     Distro
@@ -52,7 +67,19 @@ type Personality struct {
 	AuthFailJitterMS int
 	EchoBaseMS       int
 	EchoJitterMS     int
+
+	// kernel carries the build string and ship date behind KernelRel, so that
+	// /proc/version, the Debian MOTD and the uptime clamp all agree.
+	kernel kernel
+
+	// cpu carries the vendor, family and feature flags behind CPUModel, so
+	// /proc/cpuinfo cannot describe an AMD part as an Intel one.
+	cpu cpuModel
 }
+
+// kernelBuild is the build identification uname -v reports, e.g.
+// "#1 SMP Debian 5.10.209-2 (2024-01-31)".
+func (p *Personality) kernelBuild() string { return p.kernel.Build }
 
 // Distro carries the identity strings that `uname`, /etc/os-release and the
 // login banner all have to agree on. Disagreement between them is itself a
@@ -84,12 +111,41 @@ var distros = []Distro{
 	{ID: "centos", Name: "CentOS Linux", Version: "7 (Core)", VersionID: "7", Codename: "Core", PrettyName: "CentOS Linux 7 (Core)"},
 }
 
+// kernel is one package-manager kernel build, with the date it shipped.
+//
+// The date is what keeps uptime honest. Uptime is drawn from a wide range so
+// the fleet does not look freshly booted, but a box cannot have been up longer
+// than its kernel has existed -- and `uname -r` next to `uptime` is two
+// commands anyone runs in the first minute of a session. Derive clamps the boot
+// time to this date.
+type kernel struct {
+	Release  string
+	Build    string
+	Released time.Time
+}
+
+func released(y int, m time.Month, d int) time.Time {
+	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
+}
+
 // kernelsByDistro keeps uname output plausible for the chosen distribution.
 // A Debian 12 box reporting a CentOS kernel string is an instant tell.
-var kernelsByDistro = map[string][]string{
-	"ubuntu": {"5.15.0-91-generic", "5.15.0-105-generic", "5.4.0-174-generic", "6.5.0-27-generic"},
-	"debian": {"5.10.0-28-amd64", "5.10.0-30-amd64", "6.1.0-18-amd64"},
-	"centos": {"3.10.0-1160.108.1.el7.x86_64", "3.10.0-1160.114.2.el7.x86_64"},
+var kernelsByDistro = map[string][]kernel{
+	"ubuntu": {
+		{"5.15.0-91-generic", "#101-Ubuntu SMP Tue Nov 14 13:30:08 UTC 2023", released(2023, time.December, 6)},
+		{"5.15.0-105-generic", "#115-Ubuntu SMP Mon Apr 15 09:52:04 UTC 2024", released(2024, time.April, 19)},
+		{"5.4.0-174-generic", "#193-Ubuntu SMP Thu Feb 22 15:34:22 UTC 2024", released(2024, time.March, 4)},
+		{"6.5.0-27-generic", "#28~22.04.1-Ubuntu SMP Fri Mar 22 15:07:59 UTC 2024", released(2024, time.April, 10)},
+	},
+	"debian": {
+		{"5.10.0-28-amd64", "#1 SMP Debian 5.10.209-2 (2024-01-31)", released(2024, time.February, 5)},
+		{"5.10.0-30-amd64", "#1 SMP Debian 5.10.218-1 (2024-06-01)", released(2024, time.June, 5)},
+		{"6.1.0-18-amd64", "#1 SMP PREEMPT_DYNAMIC Debian 6.1.76-1 (2024-02-01)", released(2024, time.February, 8)},
+	},
+	"centos": {
+		{"3.10.0-1160.108.1.el7.x86_64", "#1 SMP Thu Jan 25 16:17:31 UTC 2024", released(2024, time.January, 30)},
+		{"3.10.0-1160.114.2.el7.x86_64", "#1 SMP Wed Mar 20 15:54:52 UTC 2024", released(2024, time.March, 26)},
+	},
 }
 
 // sshBanners is weighted by observed real-world prevalence rather than being a
@@ -110,17 +166,39 @@ var sshBanners = []struct {
 	{"SSH-2.0-OpenSSH_8.0", 5},
 }
 
-var cpuModels = []struct {
-	model string
-	mhz   float64
-}{
-	{"Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz", 2400.000},
-	{"Intel(R) Xeon(R) CPU E5-2670 v3 @ 2.30GHz", 2300.000},
-	{"Intel(R) Xeon(R) Gold 6248R CPU @ 3.00GHz", 3000.000},
-	{"Intel(R) Xeon(R) Platinum 8259CL CPU @ 2.50GHz", 2500.000},
-	{"AMD EPYC 7401P 24-Core Processor", 2000.000},
-	{"AMD EPYC 7B12", 2250.000},
-	{"Intel(R) Xeon(R) CPU E3-1245 v5 @ 3.50GHz", 3500.000},
+// cpuModel carries everything /proc/cpuinfo has to keep consistent with the
+// model name.
+//
+// vendor, family and model used to be hardcoded to Intel's values for every
+// entry, so the AMD parts advertised "AMD EPYC 7B12" under vendor_id
+// GenuineIntel with an Intel family and stepping. `cat /proc/cpuinfo` shows all
+// of it in one screen.
+type cpuModel struct {
+	model  string
+	mhz    float64
+	vendor string
+	family int
+	num    int
+	cache  string
+	flags  string
+}
+
+const (
+	intelFlags = "fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology cpuid tsc_known_freq pni pclmulqdq ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch invpcid_single fsgsbase bmi1 avx2 smep bmi2 erms invpcid xsaveopt arat"
+
+	// AMD parts expose a different feature set: no Intel-specific entries such
+	// as tsc_known_freq or invpcid_single, plus the AMD-only extensions.
+	amdFlags = "fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm rep_good nopl cpuid extd_apicid tsc_known_freq pni pclmulqdq ssse3 fma cx16 sse4_1 sse4_2 x2apic movbe popcnt aes xsave avx f16c rdrand hypervisor lahf_lm cmp_legacy svm cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw topoext perfctr_core ssbd ibpb vmmcall fsgsbase bmi1 avx2 smep bmi2 rdseed adx smap clflushopt sha_ni xsaveopt xsavec xgetbv1 clzero xsaveerptr arat npt nrip_save umip rdpid"
+)
+
+var cpuModels = []cpuModel{
+	{"Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz", 2400.000, "GenuineIntel", 6, 79, "35840 KB", intelFlags},
+	{"Intel(R) Xeon(R) CPU E5-2670 v3 @ 2.30GHz", 2300.000, "GenuineIntel", 6, 63, "30720 KB", intelFlags},
+	{"Intel(R) Xeon(R) Gold 6248R CPU @ 3.00GHz", 3000.000, "GenuineIntel", 6, 85, "36608 KB", intelFlags},
+	{"Intel(R) Xeon(R) Platinum 8259CL CPU @ 2.50GHz", 2500.000, "GenuineIntel", 6, 85, "36608 KB", intelFlags},
+	{"AMD EPYC 7401P 24-Core Processor", 2000.000, "AuthenticAMD", 23, 1, "512 KB", amdFlags},
+	{"AMD EPYC 7B12", 2250.000, "AuthenticAMD", 23, 49, "512 KB", amdFlags},
+	{"Intel(R) Xeon(R) CPU E3-1245 v5 @ 3.50GHz", 3500.000, "GenuineIntel", 6, 94, "8192 KB", intelFlags},
 }
 
 // hostnamePatterns reflect how real VPS instances are actually named: provider
@@ -184,16 +262,25 @@ func Derive(seed string) *Personality {
 	cores := coreChoices[r.Intn(len(coreChoices))]
 	memGB := cores * []int{1, 2, 2, 4}[r.Intn(4)]
 
+	kern := kernels[r.Intn(len(kernels))]
+
 	p := &Personality{
 		Seed:       seed,
 		Hostname:   hostnamePatterns[r.Intn(len(hostnamePatterns))](r),
 		Distro:     distro,
-		KernelRel:  kernels[r.Intn(len(kernels))],
+		KernelRel:  kern.Release,
+		kernel:     kern,
 		Arch:       "x86_64",
 		CPUModel:   cpu.model,
+		cpu:        cpu,
 		CPUCores:   cores,
 		CPUMHz:     cpu.mhz + float64(r.Intn(200))-100,
-		MemTotalKB: memGB * 1024 * 1024,
+
+		// Never an exact power of two. Real firmware and the kernel reserve a
+		// slice before MemTotal is reported, so a machine advertising exactly
+		// 4194304 kB has never existed; the reserved fraction varies by host,
+		// which is why it is drawn rather than fixed.
+		MemTotalKB: memGB*1024*1024 - (16*1024 + r.Intn(48*1024)),
 		SwapKB:     []int{0, 524288, 1048576, 2097152}[r.Intn(4)],
 		MACAddr:    deriveMAC(r),
 		InternalIP: fmt.Sprintf("10.%d.%d.%d", r.Intn(256), r.Intn(256), r.Intn(254)+1),
@@ -207,6 +294,18 @@ func Derive(seed string) *Personality {
 		AuthFailJitterMS: 120 + r.Intn(400),
 		EchoBaseMS:       2 + r.Intn(12),
 		EchoJitterMS:     1 + r.Intn(9),
+	}
+
+	// A box cannot have been running longer than its kernel has existed. The
+	// unclamped draw reached back two years, which for a kernel released a few
+	// months ago is an impossibility that `uname -r` and `uptime` expose
+	// together.
+	if p.BootTime.Before(kern.Released) {
+		span := time.Since(kern.Released)
+		if span <= 0 {
+			span = time.Hour
+		}
+		p.BootTime = kern.Released.Add(time.Duration(r.Int63n(int64(span))))
 	}
 
 	p.SSHBanner = pickBanner(r)
@@ -290,8 +389,35 @@ func derivePackages(r *rand.Rand) []string {
 	return pkgs
 }
 
+// LogValue renders the personality for structured logging with the token
+// secret withheld. Without this, logging the struct at debug level would put
+// the value that keys every canary token into the log stream.
+func (p *Personality) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("hostname", p.Hostname),
+		slog.String("distro", p.Distro.PrettyName),
+		slog.String("kernel", p.KernelRel),
+		slog.String("arch", p.Arch),
+		slog.String("ssh_banner", p.SSHBanner),
+	)
+}
+
 // Uptime returns the elapsed time since the derived boot time.
 func (p *Personality) Uptime() time.Duration { return time.Since(p.BootTime) }
+
+// AccountNames lists the node's login accounts.
+//
+// This is the single source of the roster: the credential policy derives one
+// password per name here, and Passwd() renders the same set into /etc/passwd.
+// Sourcing both from this method is what stops a sensor from authenticating an
+// account that the attacker cannot then find on the system.
+func (p *Personality) AccountNames() []string {
+	out := make([]string, 0, len(p.Users))
+	for _, u := range p.Users {
+		out = append(out, u.Name)
+	}
+	return out
+}
 
 // MachineID renders a plausible /etc/machine-id: 32 lowercase hex characters.
 func (p *Personality) MachineID() string {
@@ -304,19 +430,19 @@ func (p *Personality) ProcCPUInfo() string {
 	var b strings.Builder
 	for i := 0; i < p.CPUCores; i++ {
 		fmt.Fprintf(&b, "processor\t: %d\n", i)
-		b.WriteString("vendor_id\t: GenuineIntel\n")
-		b.WriteString("cpu family\t: 6\n")
-		b.WriteString("model\t\t: 79\n")
+		fmt.Fprintf(&b, "vendor_id\t: %s\n", p.cpu.vendor)
+		fmt.Fprintf(&b, "cpu family\t: %d\n", p.cpu.family)
+		fmt.Fprintf(&b, "model\t\t: %d\n", p.cpu.num)
 		fmt.Fprintf(&b, "model name\t: %s\n", p.CPUModel)
 		b.WriteString("stepping\t: 1\n")
 		fmt.Fprintf(&b, "cpu MHz\t\t: %.3f\n", p.CPUMHz)
-		b.WriteString("cache size\t: 35840 KB\n")
+		fmt.Fprintf(&b, "cache size\t: %s\n", p.cpu.cache)
 		fmt.Fprintf(&b, "physical id\t: %d\n", 0)
 		fmt.Fprintf(&b, "siblings\t: %d\n", p.CPUCores)
 		fmt.Fprintf(&b, "core id\t\t: %d\n", i)
 		fmt.Fprintf(&b, "cpu cores\t: %d\n", p.CPUCores)
 		b.WriteString("fpu\t\t: yes\n")
-		b.WriteString("flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology cpuid tsc_known_freq pni pclmulqdq ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch invpcid_single fsgsbase bmi1 avx2 smep bmi2 erms invpcid xsaveopt arat\n")
+		fmt.Fprintf(&b, "flags\t\t: %s\n", p.cpu.flags)
 		fmt.Fprintf(&b, "bogomips\t: %.2f\n", p.CPUMHz*2)
 		b.WriteString("clflush size\t: 64\n")
 		b.WriteString("cache_alignment\t: 64\n")
@@ -361,8 +487,11 @@ func (p *Personality) ProcVersion() string {
 		builder = "mockbuild@kbuilder.bsys.centos.org"
 		gcc = "4.8.5 20150623 (Red Hat 4.8.5-44)"
 	}
-	return fmt.Sprintf("Linux version %s (%s) (gcc (GCC) %s) #1 SMP %s\n",
-		p.KernelRel, builder, gcc, p.BootTime.Format("Mon Jan 2 15:04:05 UTC 2006"))
+	// The trailer is the kernel's build identification, not the boot time.
+	// /proc/version reports when the kernel was compiled; deriving it from
+	// boot time made every node claim a kernel built the instant it started.
+	return fmt.Sprintf("Linux version %s (%s) (gcc (GCC) %s) %s\n",
+		p.KernelRel, builder, gcc, p.kernel.Build)
 }
 
 // ProcUptime renders /proc/uptime: seconds since boot, then idle seconds.
@@ -380,12 +509,32 @@ func (p *Personality) OSRelease() string {
 	fmt.Fprintf(&b, "VERSION_ID=\"%s\"\n", d.VersionID)
 	fmt.Fprintf(&b, "VERSION=\"%s\"\n", d.Version)
 	fmt.Fprintf(&b, "ID=%s\n", d.ID)
-	if d.ID == "ubuntu" {
+
+	// Each distribution's own trailer. The previous version emitted Ubuntu's
+	// for all three, so a Debian or CentOS node advertised UBUNTU_CODENAME in
+	// its own /etc/os-release -- a contradiction anyone reads the moment the
+	// shell opens, and one that costs nothing to get right.
+	switch d.ID {
+	case "ubuntu":
 		b.WriteString("ID_LIKE=debian\n")
+		b.WriteString("HOME_URL=\"https://www.ubuntu.com/\"\n")
+		b.WriteString("SUPPORT_URL=\"https://help.ubuntu.com/\"\n")
+		b.WriteString("BUG_REPORT_URL=\"https://bugs.launchpad.net/ubuntu/\"\n")
+		b.WriteString("PRIVACY_POLICY_URL=\"https://www.ubuntu.com/legal/terms-and-policies/privacy-policy\"\n")
+		fmt.Fprintf(&b, "UBUNTU_CODENAME=%s\n", d.Codename)
+	case "debian":
+		b.WriteString("HOME_URL=\"https://www.debian.org/\"\n")
+		b.WriteString("SUPPORT_URL=\"https://www.debian.org/support\"\n")
+		b.WriteString("BUG_REPORT_URL=\"https://bugs.debian.org/\"\n")
+	case "centos":
+		b.WriteString("ID_LIKE=\"rhel fedora\"\n")
+		b.WriteString("ANSI_COLOR=\"0;31\"\n")
+		fmt.Fprintf(&b, "CPE_NAME=\"cpe:/o:centos:centos:%s\"\n", d.VersionID)
+		b.WriteString("HOME_URL=\"https://www.centos.org/\"\n")
+		b.WriteString("BUG_REPORT_URL=\"https://bugs.centos.org/\"\n")
+		fmt.Fprintf(&b, "CENTOS_MANTISBT_PROJECT=\"CentOS-%s\"\n", d.VersionID)
+		fmt.Fprintf(&b, "REDHAT_SUPPORT_PRODUCT_VERSION=\"%s\"\n", d.VersionID)
 	}
-	fmt.Fprintf(&b, "HOME_URL=\"https://www.%s.org/\"\n", d.ID)
-	fmt.Fprintf(&b, "SUPPORT_URL=\"https://help.%s.com/\"\n", d.ID)
-	fmt.Fprintf(&b, "UBUNTU_CODENAME=%s\n", d.Codename)
 	return b.String()
 }
 
@@ -427,19 +576,38 @@ func (p *Personality) Passwd() string {
 // MOTD renders the login banner. Distro-appropriate, with an uptime-consistent
 // "last login" line supplied separately by the shell.
 func (p *Personality) MOTD() string {
-	if p.Distro.ID == "centos" {
+	// Each distribution has its own login banner, and they look nothing alike.
+	// This used to serve Canonical's for Debian as well: a Debian box pointing
+	// the operator at help.ubuntu.com and landscape.canonical.com, which is
+	// not a subtle inconsistency but the wrong operating system's branding on
+	// the first screen after login.
+	switch p.Distro.ID {
+	case "centos":
+		// CentOS 7 ships no MOTD by default.
 		return ""
+
+	case "debian":
+		var b strings.Builder
+		fmt.Fprintf(&b, "Linux %s %s %s %s\r\n\r\n", p.Hostname, p.KernelRel, p.kernelBuild(), p.Arch)
+		b.WriteString("The programs included with the Debian GNU/Linux system are free software;\r\n")
+		b.WriteString("the exact distribution terms for each program are described in the\r\n")
+		b.WriteString("individual files in /usr/share/doc/*/copyright.\r\n\r\n")
+		b.WriteString("Debian GNU/Linux comes with ABSOLUTELY NO WARRANTY, to the extent\r\n")
+		b.WriteString("permitted by applicable law.\r\n")
+		return b.String()
+
+	default:
+		var b strings.Builder
+		fmt.Fprintf(&b, "Welcome to %s (GNU/Linux %s %s)\r\n\r\n", p.Distro.PrettyName, p.KernelRel, p.Arch)
+		b.WriteString(" * Documentation:  https://help.ubuntu.com\r\n")
+		b.WriteString(" * Management:     https://landscape.canonical.com\r\n")
+		b.WriteString(" * Support:        https://ubuntu.com/advantage\r\n\r\n")
+		fmt.Fprintf(&b, "  System information as of %s\r\n\r\n", time.Now().UTC().Format("Mon Jan  2 15:04:05 UTC 2006"))
+		fmt.Fprintf(&b, "  System load:  %.2f              Processes:             %d\r\n", 0.08, 120+len(p.Packages))
+		fmt.Fprintf(&b, "  Usage of /:   %.1f%% of %.2fGB   Users logged in:       0\r\n", 34.2, 38.71)
+		fmt.Fprintf(&b, "  Memory usage: %d%%                IPv4 address for eth0: %s\r\n", 12, p.InternalIP)
+		fmt.Fprintf(&b, "  Swap usage:   %d%%\r\n\r\n", 0)
+		b.WriteString("0 updates can be applied immediately.\r\n\r\n")
+		return b.String()
 	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "Welcome to %s (GNU/Linux %s %s)\r\n\r\n", p.Distro.PrettyName, p.KernelRel, p.Arch)
-	b.WriteString(" * Documentation:  https://help.ubuntu.com\r\n")
-	b.WriteString(" * Management:     https://landscape.canonical.com\r\n")
-	b.WriteString(" * Support:        https://ubuntu.com/advantage\r\n\r\n")
-	fmt.Fprintf(&b, "  System information as of %s\r\n\r\n", time.Now().UTC().Format("Mon Jan  2 15:04:05 UTC 2006"))
-	fmt.Fprintf(&b, "  System load:  %.2f              Processes:             %d\r\n", 0.08, 120+len(p.Packages))
-	fmt.Fprintf(&b, "  Usage of /:   %.1f%% of %.2fGB   Users logged in:       0\r\n", 34.2, 38.71)
-	fmt.Fprintf(&b, "  Memory usage: %d%%                IPv4 address for eth0: %s\r\n", 12, p.InternalIP)
-	fmt.Fprintf(&b, "  Swap usage:   %d%%\r\n\r\n", 0)
-	b.WriteString("0 updates can be applied immediately.\r\n\r\n")
-	return b.String()
 }
