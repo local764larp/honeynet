@@ -17,7 +17,13 @@ pub trait Store: Send + Sync + 'static {
     /// Persists one normalized event.
     async fn put_event(&self, event: &Event) -> Result<()>;
 
-    /// Number of events held. Used by tests and the health endpoint.
+    /// Rows currently persisted.
+    ///
+    /// Not on the serving path -- /stats reads the in-memory index, because
+    /// that is what the dashboard needs and it costs no query. This exists to
+    /// verify durability: it is the only way to ask a sink what it actually
+    /// wrote, which is what the Postgres tests below assert on.
+    #[allow(dead_code)]
     async fn count(&self) -> Result<u64>;
 }
 
@@ -33,11 +39,15 @@ impl MemoryStore {
         Self::default()
     }
 
+    /// Everything written, in arrival order. Inspection for tests; production
+    /// reads go through the index.
+    #[allow(dead_code)]
     pub fn events(&self) -> Vec<Event> {
         self.events.lock().expect("memory store poisoned").clone()
     }
 
     /// Returns every event belonging to one session, in arrival order.
+    #[allow(dead_code)]
     pub fn session(&self, session_id: &str) -> Vec<Event> {
         self.events
             .lock()
@@ -174,6 +184,10 @@ impl PostgresStore {
         Ok(())
     }
 
+    /// The underlying connection pool, for queries the Store trait does not
+    /// express. Used by the integration tests to assert on schema-level
+    /// behaviour such as session upserts and the replay conflict clause.
+    #[allow(dead_code)]
     pub fn pool(&self) -> &sqlx::PgPool {
         &self.pool
     }
@@ -396,5 +410,165 @@ mod tests {
         assert_eq!(s.session("S1").len(), 2);
         assert_eq!(s.session("S2").len(), 1);
         assert_eq!(s.session("nope").len(), 0);
+    }
+
+    // ---- Postgres ----
+    //
+    // The archival sink was wired into main.rs and never executed: every
+    // end-to-end run used the JSONL sink, so the only thing known about this
+    // path was that it compiled. These tests run the real migration against a
+    // real server and put events through it.
+    //
+    // Skipped when DATABASE_URL is unset so a local `cargo test` still works
+    // without a database. CI always sets it, so the path cannot silently go
+    // unexercised there -- which is exactly how it stayed unverified before.
+
+    async fn pg() -> Option<PostgresStore> {
+        let url = std::env::var("DATABASE_URL").ok()?;
+        let store = PostgresStore::connect(&url, 4)
+            .await
+            .expect("connect to DATABASE_URL");
+        store.migrate().await.expect("apply migration");
+
+        // Each test starts from a clean slate; the migration is idempotent but
+        // rows from a previous test are not.
+        sqlx::query("TRUNCATE events, sessions CASCADE")
+            .execute(store.pool())
+            .await
+            .expect("truncate");
+        Some(store)
+    }
+
+    macro_rules! require_pg {
+        () => {
+            match pg().await {
+                Some(s) => s,
+                None => {
+                    eprintln!("skipping: DATABASE_URL is not set");
+                    return;
+                }
+            }
+        };
+    }
+
+    #[tokio::test]
+    async fn postgres_migration_is_idempotent() {
+        let store = require_pg!();
+        // Startup applies the schema every time, so a restart against an
+        // existing database must not fail.
+        store.migrate().await.expect("second migration");
+        store.migrate().await.expect("third migration");
+    }
+
+    #[tokio::test]
+    async fn postgres_round_trips_events() {
+        let store = require_pg!();
+
+        store.put_event(&event("node-a", 1, "S1")).await.unwrap();
+        store.put_event(&event("node-a", 2, "S1")).await.unwrap();
+        store.put_event(&event("node-a", 3, "S2")).await.unwrap();
+
+        assert_eq!(store.count().await.unwrap(), 3);
+
+        // The session aggregate must exist for every session referenced by an
+        // event, which is what upsert_session is for.
+        let sessions: i64 = sqlx::query_scalar("SELECT count(*) FROM sessions")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(sessions, 2, "one session row per distinct session_id");
+    }
+
+    // Sensors replay their spool after a collector outage, so the same event
+    // arrives more than once. The ON CONFLICT clause is what stops that from
+    // double-counting, and nothing tested it.
+    #[tokio::test]
+    async fn postgres_replay_does_not_duplicate() {
+        let store = require_pg!();
+
+        let e = event("node-b", 7, "S9");
+        for _ in 0..5 {
+            store.put_event(&e).await.unwrap();
+        }
+
+        assert_eq!(
+            store.count().await.unwrap(),
+            1,
+            "replaying one event five times must leave a single row"
+        );
+    }
+
+    // Two sensors number their events independently, so seq collides across
+    // nodes constantly. The primary key is (node_id, seq) for that reason.
+    #[tokio::test]
+    async fn postgres_separates_nodes_sharing_a_sequence_number() {
+        let store = require_pg!();
+
+        store.put_event(&event("node-x", 1, "SX")).await.unwrap();
+        store.put_event(&event("node-y", 1, "SY")).await.unwrap();
+
+        assert_eq!(
+            store.count().await.unwrap(),
+            2,
+            "same seq from two nodes must be two rows, not an overwrite"
+        );
+    }
+
+    // A child event can arrive before the session-start that describes it,
+    // after a replay or a gap. The session row still has to exist.
+    #[tokio::test]
+    async fn postgres_tolerates_out_of_order_arrival() {
+        let store = require_pg!();
+
+        store
+            .put_event(&event("node-c", 2, "S-late"))
+            .await
+            .unwrap();
+        store
+            .put_event(&event("node-c", 1, "S-late"))
+            .await
+            .unwrap();
+
+        assert_eq!(store.count().await.unwrap(), 2);
+
+        let sessions: i64 = sqlx::query_scalar("SELECT count(*) FROM sessions WHERE id = 'S-late'")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(sessions, 1);
+    }
+
+    // Events with no session -- heartbeats and node-level anomalies -- must
+    // persist without inventing a session row for them.
+    #[tokio::test]
+    async fn postgres_accepts_events_without_a_session() {
+        let store = require_pg!();
+
+        store.put_event(&event("node-d", 1, "")).await.unwrap();
+
+        assert_eq!(store.count().await.unwrap(), 1);
+        let sessions: i64 = sqlx::query_scalar("SELECT count(*) FROM sessions")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            sessions, 0,
+            "a session-less event must not create a session"
+        );
+    }
+
+    // The tee is how production writes both sinks at once; if it dropped one
+    // side the archive would silently diverge from the live feed.
+    #[tokio::test]
+    async fn postgres_tee_writes_both_sinks() {
+        let store = require_pg!();
+
+        let mem = MemoryStore::new();
+        let tee = TeeStore::new(store, mem);
+
+        tee.put_event(&event("node-t", 1, "ST")).await.unwrap();
+        tee.put_event(&event("node-t", 2, "ST")).await.unwrap();
+
+        assert_eq!(tee.count().await.unwrap(), 2);
     }
 }

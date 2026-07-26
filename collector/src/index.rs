@@ -152,18 +152,19 @@ impl LiveIndex {
         // Node-level telemetry has no session and updates fleet health instead.
         if event.session_id.is_empty() {
             if let Payload::Heartbeat(h) = &event.payload {
-                let entry = inner
-                    .nodes
-                    .entry(event.node_id.clone())
-                    .or_insert_with(|| NodeHealth {
-                        node_id: event.node_id.clone(),
-                        last_seen: event.ts_collector,
-                        uptime_ms: 0,
-                        spool_depth: 0,
-                        spool_dropped: 0,
-                        build_version: String::new(),
-                        events: 0,
-                    });
+                let entry =
+                    inner
+                        .nodes
+                        .entry(event.node_id.clone())
+                        .or_insert_with(|| NodeHealth {
+                            node_id: event.node_id.clone(),
+                            last_seen: event.ts_collector,
+                            uptime_ms: 0,
+                            spool_depth: 0,
+                            spool_dropped: 0,
+                            build_version: String::new(),
+                            events: 0,
+                        });
                 entry.last_seen = event.ts_collector;
                 entry.uptime_ms = h.uptime_ms;
                 entry.spool_depth = h.spool_depth;
@@ -334,7 +335,9 @@ impl LiveIndex {
             .filter(|s| !with_attacks || !s.detected_attacks.is_empty())
             .collect();
 
-        all.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        // Newest first. sort_by_key with Reverse rather than a comparator so
+        // the ordering cannot be silently inverted by an edit to the closure.
+        all.sort_by_key(|s| std::cmp::Reverse(s.started_at));
         all.into_iter().skip(offset).take(limit).cloned().collect()
     }
 
@@ -358,6 +361,12 @@ impl LiveIndex {
             .unwrap_or_default()
     }
 
+    /// Most recent events across all sessions.
+    ///
+    /// Not on the serving path: the live feed pushes events over /stream as
+    /// they arrive rather than polling for them. Retained because it is the
+    /// only way to read the ring buffer, which the eviction tests assert on.
+    #[allow(dead_code)]
     pub fn recent(&self, limit: usize) -> Vec<Event> {
         let inner = self.inner.lock().expect("index poisoned");
         inner.recent.iter().rev().take(limit).cloned().collect()
@@ -511,7 +520,10 @@ mod tests {
         }
         let stats = idx.stats();
         assert_eq!(stats.sessions as usize, MAX_SESSIONS);
-        assert!(idx.session("S0").is_none(), "oldest session should be evicted");
+        assert!(
+            idx.session("S0").is_none(),
+            "oldest session should be evicted"
+        );
         assert!(idx.session(&format!("S{}", MAX_SESSIONS + 49)).is_some());
     }
 
@@ -537,7 +549,10 @@ mod tests {
         assert_eq!(idx.sessions(10, 0, None, None, false).len(), 2);
         assert_eq!(idx.sessions(10, 0, Some("ssh"), None, false).len(), 2);
         assert_eq!(idx.sessions(10, 0, Some("http"), None, false).len(), 0);
-        assert_eq!(idx.sessions(10, 0, None, Some("203.0.113.5"), false).len(), 1);
+        assert_eq!(
+            idx.sessions(10, 0, None, Some("203.0.113.5"), false).len(),
+            1
+        );
         assert_eq!(idx.sessions(10, 0, None, None, true).len(), 0);
     }
 
@@ -545,7 +560,11 @@ mod tests {
     fn synthetic_geo_is_flagged_in_the_view() {
         let idx = LiveIndex::new(GeoProvider::Synthetic);
         idx.ingest(&start("S1", "203.0.113.5"));
-        let geo = idx.session("S1").unwrap().geo.expect("should have location");
+        let geo = idx
+            .session("S1")
+            .unwrap()
+            .geo
+            .expect("should have location");
         assert!(geo.synthetic, "dashboard must be able to mark demo data");
     }
 }

@@ -61,7 +61,11 @@ pub enum SeqStatus {
     /// First event seen from this node in this collector's lifetime.
     FirstSeen,
     /// Events are missing.
-    Gap { expected: u64, got: u64, missing: u64 },
+    Gap {
+        expected: u64,
+        got: u64,
+        missing: u64,
+    },
     /// A sequence number we have already processed.
     Replay { last: u64, got: u64 },
 }

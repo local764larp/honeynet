@@ -30,7 +30,7 @@ use tower_http::services::{ServeDir, ServeFile};
 use tracing::{info, warn};
 
 use crate::index::LiveIndex;
-use crate::model::{Event, Payload};
+use crate::model::Event;
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -65,9 +65,8 @@ pub fn router(state: ApiState, dashboard_dir: Option<PathBuf>) -> Router {
         let index = dir.join("index.html");
         if index.exists() {
             info!(path = %dir.display(), "serving dashboard");
-            app = app.fallback_service(
-                ServeDir::new(&dir).not_found_service(ServeFile::new(index)),
-            );
+            app =
+                app.fallback_service(ServeDir::new(&dir).not_found_service(ServeFile::new(index)));
         } else {
             warn!(path = %dir.display(), "dashboard directory has no index.html; not serving it");
         }
@@ -190,7 +189,9 @@ async fn iocs(State(s): State<ApiState>) -> impl IntoResponse {
         .map(|(ip, (n, cmds, arts))| IocEntry {
             value: ip,
             count: n,
-            context: Some(format!("{n} session(s), {cmds} command(s), {arts} payload ref(s)")),
+            context: Some(format!(
+                "{n} session(s), {cmds} command(s), {arts} payload ref(s)"
+            )),
         })
         .collect();
 
@@ -214,7 +215,11 @@ async fn iocs(State(s): State<ApiState>) -> impl IntoResponse {
                 acc
             })
             .into_iter()
-            .map(|(value, count)| IocEntry { value, count, context: None })
+            .map(|(value, count)| IocEntry {
+                value,
+                count,
+                context: None,
+            })
             .collect(),
         note: "Credential patterns are character-class shapes, never harvested pairs.",
     })
@@ -229,7 +234,9 @@ async fn profile(State(s): State<ApiState>) -> impl IntoResponse {
     let Some(path) = s.profile_path.clone() else {
         return (
             StatusCode::NOT_FOUND,
-            Json(err("no profile path configured; run honeynet-ml report --out <path>")),
+            Json(err(
+                "no profile path configured; run honeynet-ml report --out <path>",
+            )),
         )
             .into_response();
     };
@@ -295,7 +302,9 @@ async fn profile(State(s): State<ApiState>) -> impl IntoResponse {
 }
 
 /// Server-sent events feed of live activity.
-async fn stream(State(s): State<ApiState>) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
+async fn stream(
+    State(s): State<ApiState>,
+) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
     let rx = s.events.subscribe();
 
     let stream = BroadcastStream::new(rx).filter_map(|res| match res {
@@ -326,7 +335,11 @@ fn err(msg: &str) -> serde_json::Value {
 fn to_entries(counts: HashMap<String, u64>) -> Vec<IocEntry> {
     let mut v: Vec<IocEntry> = counts
         .into_iter()
-        .map(|(value, count)| IocEntry { value, count, context: None })
+        .map(|(value, count)| IocEntry {
+            value,
+            count,
+            context: None,
+        })
         .collect();
     v.sort_by(|a, b| b.count.cmp(&a.count).then(a.value.cmp(&b.value)));
     v
@@ -375,26 +388,15 @@ fn shape(s: &str) -> String {
         .collect()
 }
 
-/// summarize_event renders a one-line description for the live feed, so the
-/// dashboard does not have to duplicate payload knowledge.
-pub fn summarize_event(e: &Event) -> String {
-    match &e.payload {
-        Payload::SessionStart(s) => format!("{} session from {}", s.protocol.as_str(), s.peer.src_ip),
-        Payload::SessionEnd(s) => format!("session ended ({})", s.reason),
-        Payload::Auth(a) => {
-            let verdict = if a.success { "accepted" } else { "rejected" };
-            format!("{} {}:{}", verdict, a.username, shape(&a.password))
-        }
-        Payload::Command(c) => format!("$ {}", c.raw),
-        Payload::Artifact(a) => format!("payload referenced: {}", a.url),
-        Payload::Upload(u) => format!("upload {} ({} bytes)", u.claimed_name, u.size_bytes),
-        Payload::HttpRequest(h) => format!("{} {} -> {}", h.method, h.path, h.response_status),
-        Payload::RdpConnect(r) => format!("rdp cookie {}", r.cookie),
-        Payload::Canary(c) => format!("CANARY {} ({})", c.token_id, c.planted_path),
-        Payload::Heartbeat(h) => format!("heartbeat, spool {}", h.spool_depth),
-        Payload::Anomaly(a) => format!("anomaly: {}", a.kind),
-    }
-}
+// summarize_event lived here and rendered a one-line description of an event
+// for the live feed. It was never called: the dashboard has always had its own
+// summarize() in api.ts, so the two were parallel implementations of the same
+// match over every payload variant, and only one of them ran.
+//
+// The client's copy is the one that ships, and rendering is a presentation
+// concern that belongs there. Removed rather than wired up, because keeping
+// both is how the wording of a feed line ends up depending on which layer
+// happened to produce it.
 
 #[cfg(test)]
 mod tests {
@@ -410,14 +412,26 @@ mod tests {
     #[test]
     fn distinct_passwords_collapse_to_one_shape() {
         // This is what makes the published pattern non-identifying.
-        assert_eq!(credential_shape("root:vizxv"), credential_shape("root:admin"));
+        assert_eq!(
+            credential_shape("root:vizxv"),
+            credential_shape("root:admin")
+        );
     }
 
     #[test]
     fn extracts_hosts_from_payload_urls() {
-        assert_eq!(host_of("http://1.2.3.4/bins.sh").as_deref(), Some("1.2.3.4"));
-        assert_eq!(host_of("https://evil.test:8443/x").as_deref(), Some("evil.test"));
-        assert_eq!(host_of("ldap://198.51.100.7:1389/a").as_deref(), Some("198.51.100.7"));
+        assert_eq!(
+            host_of("http://1.2.3.4/bins.sh").as_deref(),
+            Some("1.2.3.4")
+        );
+        assert_eq!(
+            host_of("https://evil.test:8443/x").as_deref(),
+            Some("evil.test")
+        );
+        assert_eq!(
+            host_of("ldap://198.51.100.7:1389/a").as_deref(),
+            Some("198.51.100.7")
+        );
         assert_eq!(host_of("not a url"), None);
     }
 }

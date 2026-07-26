@@ -33,7 +33,11 @@ use store::{JsonlStore, MemoryStore, PostgresStore, Store, TeeStore};
 #[command(name = "honeynet-collector", version, about)]
 struct Args {
     /// NATS server URL.
-    #[arg(long, env = "COLLECTOR_NATS_URL", default_value = "nats://127.0.0.1:4222")]
+    #[arg(
+        long,
+        env = "COLLECTOR_NATS_URL",
+        default_value = "nats://127.0.0.1:4222"
+    )]
     nats_url: String,
 
     /// Postgres connection string. Omit to run with an in-memory store, which
@@ -228,7 +232,11 @@ async fn run<S: Store>(args: Args, store: Arc<S>) -> Result<()> {
     }
 
     let s = ingestor.stats().await;
-    info!(received = s.received, stored = s.stored, "collector stopped");
+    info!(
+        received = s.received,
+        stored = s.stored,
+        "collector stopped"
+    );
     Ok(())
 }
 

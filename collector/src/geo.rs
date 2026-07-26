@@ -30,15 +30,23 @@ pub struct GeoInfo {
     pub synthetic: bool,
 }
 
+/// The opened MaxMind databases. Either may be absent: an operator can supply
+/// city data without ASN data or the reverse.
+pub struct MaxMindReaders {
+    pub city: Option<maxminddb::Reader<Vec<u8>>>,
+    pub asn: Option<maxminddb::Reader<Vec<u8>>>,
+}
+
 /// Where location data comes from.
+///
+/// The MaxMind variant is boxed because it carries two memory-mapped database
+/// readers. Inline, it made every GeoProvider value -- including Disabled, the
+/// default -- as large as the readers, which is paid on every move of the enum.
 pub enum GeoProvider {
     /// No enrichment. Sessions carry no location.
     Disabled,
     /// MaxMind GeoLite2 City and/or ASN databases.
-    MaxMind {
-        city: Option<maxminddb::Reader<Vec<u8>>>,
-        asn: Option<maxminddb::Reader<Vec<u8>>>,
-    },
+    MaxMind(Box<MaxMindReaders>),
     /// Deterministic fake coordinates, for local development only.
     ///
     /// The end-to-end harness drives every session from 127.0.0.1, which would
@@ -77,7 +85,7 @@ impl GeoProvider {
         if city.is_none() && asn.is_none() {
             return GeoProvider::Disabled;
         }
-        GeoProvider::MaxMind { city, asn }
+        GeoProvider::MaxMind(Box::new(MaxMindReaders { city, asn }))
     }
 
     /// Resolves an address.
@@ -89,7 +97,8 @@ impl GeoProvider {
 
             GeoProvider::Synthetic => Some(synthetic_location(ip)),
 
-            GeoProvider::MaxMind { city, asn } => {
+            GeoProvider::MaxMind(readers) => {
+                let (city, asn) = (&readers.city, &readers.asn);
                 // Private and loopback addresses have no public location, and
                 // returning one would be a lie the map would render.
                 if is_private(&addr) {
@@ -143,7 +152,7 @@ impl GeoProvider {
     pub fn describe(&self) -> &'static str {
         match self {
             GeoProvider::Disabled => "disabled",
-            GeoProvider::MaxMind { .. } => "maxmind",
+            GeoProvider::MaxMind(_) => "maxmind",
             GeoProvider::Synthetic => "synthetic (development only)",
         }
     }
@@ -165,17 +174,75 @@ fn is_private(addr: &IpAddr) -> bool {
 /// but the mapping is a hash and means nothing.
 fn synthetic_location(ip: &str) -> GeoInfo {
     const PLACES: &[(&str, &str, &str, f64, f64, u32, &str)] = &[
-        ("China", "CN", "Shanghai", 31.2222, 121.4581, 4134, "CHINANET"),
-        ("Russia", "RU", "Moscow", 55.7522, 37.6156, 12389, "Rostelecom"),
-        ("United States", "US", "Ashburn", 39.0437, -77.4875, 14618, "Amazon AWS"),
-        ("Netherlands", "NL", "Amsterdam", 52.3740, 4.8897, 60781, "LeaseWeb"),
+        (
+            "China", "CN", "Shanghai", 31.2222, 121.4581, 4134, "CHINANET",
+        ),
+        (
+            "Russia",
+            "RU",
+            "Moscow",
+            55.7522,
+            37.6156,
+            12389,
+            "Rostelecom",
+        ),
+        (
+            "United States",
+            "US",
+            "Ashburn",
+            39.0437,
+            -77.4875,
+            14618,
+            "Amazon AWS",
+        ),
+        (
+            "Netherlands",
+            "NL",
+            "Amsterdam",
+            52.3740,
+            4.8897,
+            60781,
+            "LeaseWeb",
+        ),
         ("Vietnam", "VN", "Hanoi", 21.0245, 105.8412, 45899, "VNPT"),
-        ("Brazil", "BR", "Sao Paulo", -23.5475, -46.6361, 28573, "Claro"),
+        (
+            "Brazil",
+            "BR",
+            "Sao Paulo",
+            -23.5475,
+            -46.6361,
+            28573,
+            "Claro",
+        ),
         ("India", "IN", "Mumbai", 19.0728, 72.8826, 9829, "BSNL"),
-        ("Germany", "DE", "Frankfurt", 50.1155, 8.6842, 24940, "Hetzner"),
-        ("Indonesia", "ID", "Jakarta", -6.1750, 106.8275, 7713, "Telkom"),
+        (
+            "Germany",
+            "DE",
+            "Frankfurt",
+            50.1155,
+            8.6842,
+            24940,
+            "Hetzner",
+        ),
+        (
+            "Indonesia",
+            "ID",
+            "Jakarta",
+            -6.1750,
+            106.8275,
+            7713,
+            "Telkom",
+        ),
         ("Romania", "RO", "Bucharest", 44.4323, 26.1063, 9050, "RTD"),
-        ("Singapore", "SG", "Singapore", 1.2897, 103.8501, 16509, "Amazon AWS"),
+        (
+            "Singapore",
+            "SG",
+            "Singapore",
+            1.2897,
+            103.8501,
+            16509,
+            "Amazon AWS",
+        ),
         ("France", "FR", "Roubaix", 50.6942, 3.1746, 16276, "OVH"),
     ];
 
