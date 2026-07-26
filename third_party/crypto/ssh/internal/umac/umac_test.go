@@ -118,10 +118,33 @@ func TestRFC4418VectorsUMAC96(t *testing.T) {
 	}
 }
 
-// UMAC-128 is umac-128@openssh.com. No published vector is embedded here, so
-// this asserts only the shape and the properties any MAC must have; the
-// correctness argument for it rests on the 64- and 96-bit vectors passing,
-// since the layers are identical and only the iteration count differs.
+// UMAC-32 runs a single iteration, where UMAC-64 runs two and UMAC-96 three.
+// Passing it pins the degenerate case, and together the three fix every
+// iteration count the RFC publishes a vector for.
+//
+// It also exercises the other pad-selector width: a four-byte tag takes its
+// pad from one of four slices of the AES block, chosen by the low two bits of
+// the nonce, where an eight-byte tag uses one bit and the longer tags none.
+func TestRFC4418VectorUMAC32(t *testing.T) {
+	if got := tagHex(t, 4, nil); got != "113145FB" {
+		t.Errorf("UMAC-32(empty)\n  got  %s\n  want 113145FB", got)
+	}
+}
+
+// UMAC-128 runs four iterations and is the one variant with nothing to check
+// it against: RFC 4418's verification appendix stops at UMAC-96, so no
+// published vector for it exists.
+//
+// That is not a gap in this test file, it is the reason umac-128 is withdrawn
+// from the sensor's advertised MAC list. A real OpenSSH client rejects the
+// tags this code produces for it with "Corrupted MAC on input" -- something no
+// test here can detect, because a Go client and a Go server computing the same
+// wrong tag agree with each other perfectly.
+//
+// Restoring it needs an oracle this repository does not contain: a reference
+// UMAC-128 implementation, or a real OpenSSH server to diff against. Until
+// then this asserts only shape, and the shape passing means nothing about
+// whether the value is right.
 func TestUMAC128Shape(t *testing.T) {
 	u, err := New([]byte(vectorKey), 16)
 	if err != nil {

@@ -106,21 +106,28 @@ var openSSH82 = profile{
 	// verified two ways: the RFC 4418 vectors, and a real OpenSSH client
 	// completing a session against this sensor with each one forced.
 	//
-	// umac-128 and umac-128-etm are deliberately absent. The implementation
-	// passes every published vector it can be checked against -- the RFC
-	// covers UMAC-64 and UMAC-96, and both pass -- but a real OpenSSH client
-	// rejects the 128-bit variants with "Corrupted MAC on input". The Go-to-Go
-	// interop test did not catch it because both ends ran the same wrong code.
+	// umac-128 and umac-128-etm are deliberately absent. A real OpenSSH client
+	// rejects both with "Corrupted MAC on input" while umac-64 completes a
+	// session against the same sensor.
 	//
-	// Advertising them would be worse than the gap they close. OpenSSH lists
-	// umac-128-etm second, so most clients prefer it, and a server that
-	// negotiates a MAC it computes incorrectly does not look like an unusual
-	// server -- it looks like a broken one, and drops the session before
-	// anything worth collecting happens.
+	// The implementation passes every vector that exists for it. RFC 4418's
+	// verification appendix stops at UMAC-96 -- it publishes tags for the 32-,
+	// 64- and 96-bit tag lengths and none for 128 -- and all three pass, which
+	// covers one, two and three hash iterations. UMAC-128 is the four-iteration
+	// case, and there is nothing published to check it against.
 	//
-	// The code stays in the fork behind its tests. Fixing it needs UMAC-128
-	// vectors, which the RFC appendix has and which could not be extracted
-	// here; a real OpenSSH server also works as an oracle.
+	// So the fault is real, specific to that iteration count, and not locatable
+	// from inside this repository: a Go client and a Go server computing the
+	// same wrong tag agree with each other perfectly, which is why the interop
+	// test passed it. Resolving it needs an external oracle -- a reference
+	// UMAC implementation, or a real OpenSSH server to diff against.
+	//
+	// Withdrawing costs two entries out of ten and leaves a smaller
+	// fingerprint than advertising them would. OpenSSH lists umac-128-etm
+	// second, so most clients prefer it, and a server that negotiates a MAC it
+	// computes incorrectly does not read as an unusual server -- it reads as a
+	// broken one, and drops the session before anything worth collecting has
+	// happened.
 	MACs: []string{
 		gossh.UMAC64ETM,
 		gossh.HMACSHA256ETM,
