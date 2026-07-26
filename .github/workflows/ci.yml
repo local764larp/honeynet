@@ -38,10 +38,21 @@ jobs:
       - name: buf lint
         run: buf lint
 
+      # actions/checkout leaves only the pushed ref, so `.git#branch=main`
+      # resolves against a local clone that has no main. fetch-depth: 0 gets the
+      # history but not the branch pointer.
+      - name: fetch main for comparison
+        run: git fetch origin main:main || echo "no main branch yet"
+
       - name: buf breaking against main
         # Skipped on main itself, where there is nothing to compare against.
         if: github.ref != 'refs/heads/main'
-        run: buf breaking --against '.git#branch=main'
+        run: |
+          if git rev-parse --verify main >/dev/null 2>&1; then
+            buf breaking --against '.git#branch=main'
+          else
+            echo "main does not exist yet; nothing to compare against"
+          fi
 
   go:
     name: go sensor
@@ -53,6 +64,17 @@ jobs:
         with:
           go-version: '1.26'
           cache-dependency-path: node/go.sum
+
+      # The generated protobuf bindings are not committed -- generated code in
+      # the tree drifts from the schema and turns review into diff noise. That
+      # means a clean checkout has no node/gen, and nothing compiles until buf
+      # has run. This is the step whose absence the first CI run caught.
+      - uses: bufbuild/buf-setup-action@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: generate protobuf bindings
+        run: buf generate
 
       # The forked x/crypto carries the UMAC implementation, and its RFC 4418
       # vectors are the only evidence that MAC is correct. It is a separate
