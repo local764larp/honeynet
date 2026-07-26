@@ -19,3 +19,5 @@ require (
 	github.com/nats-io/nuid v1.0.1 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 )
+
+replace golang.org/x/crypto => ../third_party/crypto
