@@ -19,6 +19,14 @@ readonly COLLECTOR_PORT="${3:-4222}"
 readonly ADMIN_SSH_PORT="${ADMIN_SSH_PORT:-61022}"
 readonly ADMIN_CIDR="${ADMIN_CIDR:?set ADMIN_CIDR to the operator source range, e.g. 203.0.113.0/24}"
 readonly RESOLVER_IP="${RESOLVER_IP:-1.1.1.1}"
+readonly NTP_IP="${NTP_IP:-${RESOLVER_IP}}"
+
+# Ports the sensor binds, and the only ones the firewall will accept. Keep in
+# step with the listener addresses written into config.json below: a port
+# accepted here with nothing behind it answers RST and reads as "closed" while
+# everything else reads as "filtered", which describes the firewall rather than
+# a server.
+readonly HONEYPOT_PORTS="${HONEYPOT_PORTS:-22, 23, 80}"
 
 readonly USER_NAME=honeynode
 readonly STATE_DIR=/var/lib/honeynode
@@ -82,6 +90,8 @@ COLLECTOR_IP="$(getent ahostsv4 "$COLLECTOR_HOST" | awk 'NR==1{print $1}')"
 sed -e "s/COLLECTOR_IP/${COLLECTOR_IP}/" \
     -e "s/COLLECTOR_PORT/${COLLECTOR_PORT}/" \
     -e "s/RESOLVER_IP/${RESOLVER_IP}/" \
+    -e "s/NTP_IP/${NTP_IP}/" \
+    -e "s|HONEYPOT_PORTS|{ ${HONEYPOT_PORTS} }|" \
     -e "s|ADMIN_CIDR|${ADMIN_CIDR}|" \
     -e "s/define admin_ssh_port = 61022/define admin_ssh_port = ${ADMIN_SSH_PORT}/" \
     "$(dirname "$0")/nftables.conf" > /etc/nftables.conf
@@ -97,6 +107,65 @@ if timeout 5 bash -c "echo > /dev/tcp/93.184.216.34/80" 2>/dev/null; then
     die "egress to an arbitrary host succeeded; containment is NOT in effect"
 fi
 log "egress containment verified"
+
+# -------------------------------------------------------- stack tuning ----
+#
+# The personality decides what the box says it is. Everything above the
+# transport can be made to agree, but nmap -O and p0f do not read banners --
+# they fingerprint the kernel from TTL, window size, option order and timestamp
+# behaviour, and those come from the real host.
+#
+# The defaults below are what a stock Linux server reports, which is what the
+# sensor claims to be. Most matter less for looking like Linux -- the host is
+# Linux -- than for not looking like a *tuned* host: a machine whose stack has
+# been hardened past the distribution defaults stands out from the population
+# it is trying to blend into, and a honeypot image is exactly the kind of thing
+# that arrives over-hardened.
+
+log "aligning TCP/IP stack with the claimed operating system"
+cat > /etc/sysctl.d/60-honeynode.conf <<'EOF'
+# Stack settings for a honeypot sensor. See provision-node.sh.
+
+# Default TTL. Linux ships 64; anything else is a one-packet giveaway, since
+# the observed hop count is what a remote fingerprint reads.
+net.ipv4.ip_default_ttl = 64
+
+# Timestamps and window scaling on, matching the distribution default. Turning
+# them off is a common hardening step and would make the host look unlike the
+# servers it is impersonating.
+net.ipv4.tcp_timestamps = 1
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_sack = 1
+
+# SYN cookies stay on -- also the distribution default, and the sensor is a
+# deliberate target for connection floods.
+net.ipv4.tcp_syncookies = 1
+
+# Never route. The forward chain already drops, but a sensor that would route
+# if the firewall lapsed is one misconfiguration away from being a relay.
+net.ipv4.ip_forward = 0
+net.ipv6.conf.all.forwarding = 0
+
+# Ignore redirects and source routing: both are ways to steer a host's traffic
+# from off-box, which on a machine attackers are invited onto is not a
+# theoretical concern.
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+
+# Answer pings. The firewall rate limits them; a host that is silent to ICMP
+# while serving three TCP ports looks filtered, and "filtered" invites exactly
+# the scrutiny the sensor is trying to avoid.
+net.ipv4.icmp_echo_ignore_all = 0
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+EOF
+
+sysctl --quiet --load /etc/sysctl.d/60-honeynode.conf
+
+# A mismatch here is silent and only visible to a remote scanner, so verify.
+actual_ttl="$(sysctl -n net.ipv4.ip_default_ttl)"
+[[ "$actual_ttl" == "64" ]] || die "ip_default_ttl is ${actual_ttl}, expected 64"
+log "stack aligned (ttl ${actual_ttl}, timestamps on, forwarding off)"
 
 # ------------------------------------------------------------- binary ----
 
@@ -143,6 +212,7 @@ cat > "${CONF_DIR}/config.json" <<EOF
   "http_addr": ":80",
   "rdp_addr": "",
   "host_key_path": "${STATE_DIR}/honeynode_host_key",
+  "credential_secret_path": "${STATE_DIR}/honeynode_credentials.secret",
   "max_sessions": 512,
   "max_sessions_per_ip": 8,
   "session_idle_timeout_sec": 180,
@@ -176,8 +246,9 @@ cat <<EOF
   node id        ${NODE_ID}
   collector      tls://${COLLECTOR_HOST}:${COLLECTOR_PORT}
   admin ssh      port ${ADMIN_SSH_PORT}, restricted to ${ADMIN_CIDR}
-  honeypot       :22 (ssh), :23 (telnet), :80 (http)
+  honeypot       ${HONEYPOT_PORTS}
   egress         default-deny, verified
+  stack          ttl 64, timestamps on, forwarding off
 
   Derived machine identity:
 
