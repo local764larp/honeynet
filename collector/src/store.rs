@@ -176,10 +176,40 @@ impl PostgresStore {
 
     /// Applies the schema. Runs at startup so a fresh deployment needs no
     /// separate migration step.
+    ///
+    /// Serialized with an advisory lock because CREATE TABLE IF NOT EXISTS is
+    /// not concurrency-safe in Postgres. Two collectors starting against the
+    /// same fresh database both see the table missing, both proceed, and the
+    /// loser fails on the unique index over the composite type the table
+    /// implicitly creates -- reported as a duplicate key on
+    /// pg_type_typname_nsp_index, which reads like corruption rather than a
+    /// race. Running two collectors is the normal way to deploy for
+    /// availability, so this is reachable on any first rollout.
     pub async fn migrate(&self) -> Result<()> {
-        sqlx::raw_sql(include_str!("../migrations/0001_init.sql"))
-            .execute(&self.pool)
+        // Arbitrary constant; only has to be the same in every collector.
+        const MIGRATION_LOCK: i64 = 0x686F_6E65_796E_6574;
+
+        let mut conn = self.pool.acquire().await?;
+
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(MIGRATION_LOCK)
+            .execute(&mut *conn)
             .await?;
+
+        let applied = sqlx::raw_sql(include_str!("../migrations/0001_init.sql"))
+            .execute(&mut *conn)
+            .await;
+
+        // Released even when the schema failed, or the next start would block
+        // forever behind a lock nobody holds a reason for.
+        let unlocked = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(MIGRATION_LOCK)
+            .execute(&mut *conn)
+            .await;
+
+        applied?;
+        unlocked?;
+
         info!("schema applied");
         Ok(())
     }
@@ -423,8 +453,21 @@ mod tests {
     // without a database. CI always sets it, so the path cannot silently go
     // unexercised there -- which is exactly how it stayed unverified before.
 
-    async fn pg() -> Option<PostgresStore> {
+    // These tests share one database and each starts by truncating it, so they
+    // cannot run concurrently -- the default test harness runs them in
+    // parallel and they wiped each other's rows, which showed up as counts
+    // that were short rather than as an obvious collision. The guard is held
+    // for the duration of each test.
+    static PG_SERIAL: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+    async fn pg() -> Option<(PostgresStore, tokio::sync::MutexGuard<'static, ()>)> {
         let url = std::env::var("DATABASE_URL").ok()?;
+
+        let guard = PG_SERIAL
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+
         let store = PostgresStore::connect(&url, 4)
             .await
             .expect("connect to DATABASE_URL");
@@ -436,13 +479,18 @@ mod tests {
             .execute(store.pool())
             .await
             .expect("truncate");
-        Some(store)
+        Some((store, guard))
     }
 
     macro_rules! require_pg {
         () => {
             match pg().await {
-                Some(s) => s,
+                Some((s, guard)) => {
+                    // Bound to the test body so the next test cannot truncate
+                    // this one's rows mid-assertion.
+                    let _serial = guard;
+                    s
+                }
                 None => {
                     eprintln!("skipping: DATABASE_URL is not set");
                     return;
