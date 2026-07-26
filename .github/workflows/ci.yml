@@ -1,0 +1,175 @@
+name: CI
+
+# Every suite runs on every push. Before this existed, scripts/build.ps1 could
+# run all of them but nothing ran build.ps1, so the only thing standing between
+# a broken sensor and main was whether someone remembered.
+#
+# The schema job matters most. proto/ is the contract four languages share, and
+# a breaking change to it fails at runtime in the collector rather than at
+# compile time in the sensor, which is the worst place to find out.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  schema:
+    name: protobuf schema
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # buf breaking needs history to resolve the comparison target.
+          fetch-depth: 0
+
+      - uses: bufbuild/buf-setup-action@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: buf lint
+        run: buf lint
+
+      - name: buf breaking against main
+        # Skipped on main itself, where there is nothing to compare against.
+        if: github.ref != 'refs/heads/main'
+        run: buf breaking --against '.git#branch=main'
+
+  go:
+    name: go sensor
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache-dependency-path: node/go.sum
+
+      # The forked x/crypto carries the UMAC implementation, and its RFC 4418
+      # vectors are the only evidence that MAC is correct. It is a separate
+      # module reached through a replace directive, so `go test ./...` in node/
+      # does not touch it -- it has to be run on its own or the vectors rot.
+      - name: forked x/crypto (umac)
+        working-directory: third_party/crypto
+        run: |
+          go vet ./ssh/...
+          go test ./ssh/internal/umac/ ./ssh/
+
+      - name: vet
+        working-directory: node
+        run: go vet ./...
+
+      - name: test
+        working-directory: node
+        run: go test -race ./...
+
+      - name: build
+        working-directory: node
+        run: |
+          go build ./...
+          go build ./cmd/honeynode
+          go build ./cmd/attacksim
+
+  rust:
+    name: rust collector
+    runs-on: ubuntu-latest
+
+    # The Postgres sink is wired into main.rs but was never exercised by a
+    # test; the JSONL sink carried every end-to-end run. A live database here
+    # is what makes the archival path verifiable rather than merely compiled.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: honeynet
+          POSTGRES_USER: honeynet
+          POSTGRES_DB: honeynet_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: collector
+
+      - name: fmt
+        working-directory: collector
+        run: cargo fmt --check
+
+      - name: clippy
+        working-directory: collector
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: test
+        working-directory: collector
+        env:
+          DATABASE_URL: postgres://honeynet:honeynet@localhost:5432/honeynet_test
+        run: cargo test
+
+  python:
+    name: python profiling pipeline
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: install
+        working-directory: ml
+        run: |
+          uv venv --python 3.12
+          uv pip install -e ".[dev]"
+
+      - name: test
+        working-directory: ml
+        run: uv run pytest -q
+
+  dashboard:
+    name: operator dashboard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+
+      - name: install
+        working-directory: dashboard
+        run: npm ci
+
+      - name: typecheck
+        working-directory: dashboard
+        run: npx tsc --noEmit
+
+      # Enabled once the dashboard has a test runner; it currently has none, so
+      # this would fail on a missing script rather than on a real regression.
+      - name: test
+        working-directory: dashboard
+        if: hashFiles('dashboard/vitest.config.ts') != ''
+        run: npm test
+
+      - name: build
+        working-directory: dashboard
+        run: npm run build
