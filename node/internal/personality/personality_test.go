@@ -152,6 +152,35 @@ func TestKernelMatchesDistribution(t *testing.T) {
 	})
 }
 
+// The SSH banner must name a build the claimed distribution actually ships.
+//
+// This shipped broken: the banner was drawn independently of the distribution,
+// so an Ubuntu 22.04 node could announce a CentOS-era OpenSSH 7.4. Found by
+// pointing a real OpenSSH client at a running sensor, not by reading the code.
+func TestSSHBannerMatchesTheDistribution(t *testing.T) {
+	sweep(t, 400, func(t *testing.T, p *Personality) {
+		banner := p.SSHBanner
+
+		switch p.Distro.ID {
+		case "ubuntu":
+			if !strings.Contains(banner, "Ubuntu") {
+				t.Errorf("%s node advertises %q", p.Distro.PrettyName, banner)
+			}
+		case "debian":
+			if !strings.Contains(banner, "Debian") {
+				t.Errorf("%s node advertises %q", p.Distro.PrettyName, banner)
+			}
+		}
+
+		// The version has to be one the handshake can serve honestly. Anything
+		// below 8.x needs key exchanges this transport cannot offer, so the
+		// node would advertise an algorithm set from the wrong decade.
+		if !strings.Contains(banner, "OpenSSH_8.") && !strings.Contains(banner, "OpenSSH_9.") {
+			t.Errorf("banner %q names a release the algorithm tables cannot serve", banner)
+		}
+	})
+}
+
 // The credential policy derives one password per account from this roster, and
 // the shell renders the same roster into /etc/passwd. If they diverged, an
 // account could authenticate and then not exist on the system.

@@ -100,16 +100,33 @@ var openSSH82 = profile{
 		gossh.CipherAES128GCM,
 		gossh.CipherAES256GCM,
 	},
-	// The complete 8.2 list, in order. The umac family and hmac-sha1-etm are
-	// not in upstream x/crypto; they come from the fork under third_party.
+	// The 8.2 list minus the 128-bit umac variants.
+	//
+	// umac-64 and hmac-sha1-etm come from the fork under third_party and are
+	// verified two ways: the RFC 4418 vectors, and a real OpenSSH client
+	// completing a session against this sensor with each one forced.
+	//
+	// umac-128 and umac-128-etm are deliberately absent. The implementation
+	// passes every published vector it can be checked against -- the RFC
+	// covers UMAC-64 and UMAC-96, and both pass -- but a real OpenSSH client
+	// rejects the 128-bit variants with "Corrupted MAC on input". The Go-to-Go
+	// interop test did not catch it because both ends ran the same wrong code.
+	//
+	// Advertising them would be worse than the gap they close. OpenSSH lists
+	// umac-128-etm second, so most clients prefer it, and a server that
+	// negotiates a MAC it computes incorrectly does not look like an unusual
+	// server -- it looks like a broken one, and drops the session before
+	// anything worth collecting happens.
+	//
+	// The code stays in the fork behind its tests. Fixing it needs UMAC-128
+	// vectors, which the RFC appendix has and which could not be extracted
+	// here; a real OpenSSH server also works as an oracle.
 	MACs: []string{
 		gossh.UMAC64ETM,
-		gossh.UMAC128ETM,
 		gossh.HMACSHA256ETM,
 		gossh.HMACSHA512ETM,
 		gossh.HMACSHA1ETM,
 		gossh.UMAC64,
-		gossh.UMAC128,
 		gossh.HMACSHA256,
 		gossh.HMACSHA512,
 		gossh.HMACSHA1,

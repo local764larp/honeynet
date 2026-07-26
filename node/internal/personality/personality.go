@@ -108,7 +108,9 @@ var distros = []Distro{
 	{ID: "ubuntu", Name: "Ubuntu", Version: "20.04.6 LTS (Focal Fossa)", VersionID: "20.04", Codename: "focal", PrettyName: "Ubuntu 20.04.6 LTS"},
 	{ID: "debian", Name: "Debian GNU/Linux", Version: "11 (bullseye)", VersionID: "11", Codename: "bullseye", PrettyName: "Debian GNU/Linux 11 (bullseye)"},
 	{ID: "debian", Name: "Debian GNU/Linux", Version: "12 (bookworm)", VersionID: "12", Codename: "bookworm", PrettyName: "Debian GNU/Linux 12 (bookworm)"},
-	{ID: "centos", Name: "CentOS Linux", Version: "7 (Core)", VersionID: "7", Codename: "Core", PrettyName: "CentOS Linux 7 (Core)"},
+	// CentOS 7 is absent because its only plausible sshd is OpenSSH 7.4, whose
+	// algorithm set x/crypto cannot serve. A CentOS node would have to
+	// contradict its own banner in the handshake; see bannersByDistro.
 }
 
 // kernel is one package-manager kernel build, with the date it shipped.
@@ -148,22 +150,41 @@ var kernelsByDistro = map[string][]kernel{
 	},
 }
 
-// sshBanners is weighted by observed real-world prevalence rather than being a
-// uniform pick. A fleet where every OpenSSH version is equally likely is itself
-// anomalous against the actual internet population.
-var sshBanners = []struct {
-	banner string
-	weight int
-}{
-	{"SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6", 22},
-	{"SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.11", 18},
-	{"SSH-2.0-OpenSSH_7.4", 14},
-	{"SSH-2.0-OpenSSH_8.4p1 Debian-5+deb11u3", 12},
-	{"SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u2", 11},
-	{"SSH-2.0-OpenSSH_7.9p1 Debian-10+deb10u2", 8},
-	{"SSH-2.0-OpenSSH_6.7p1 Debian-5+deb8u8", 5},
-	{"SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.4", 5},
-	{"SSH-2.0-OpenSSH_8.0", 5},
+// bannersByDistro pairs each distribution release with the OpenSSH build it
+// actually ships.
+//
+// Two faults are fixed here, both found by pointing a real OpenSSH client at a
+// running sensor rather than by reading the code.
+//
+// The banner used to be drawn independently of the distribution, so an Ubuntu
+// 22.04 node could announce itself as a CentOS-era OpenSSH 7.4. A release
+// string that belongs to a different operating system than /etc/os-release
+// claims is a contradiction visible before authenticating.
+//
+// The pool has also been narrowed to the 8.x line. Anything older wants key
+// exchanges x/crypto does not implement, so a node claiming 7.4 served the
+// 8.2 algorithm table -- a 2016 release advertising curve25519 and the
+// kex-strict marker that mitigates Terrapin, which was published in 2023. Seven
+// years of anachronism in the first packet is a worse tell than a fleet with
+// less version spread, so the versions that cannot be served honestly are gone,
+// and with them CentOS, whose only plausible build is 7.4.
+var bannersByDistro = map[string][]string{
+	"22.04": {
+		"SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6",
+		"SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.10",
+	},
+	"20.04": {
+		"SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.11",
+		"SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.9",
+	},
+	"11": {
+		"SSH-2.0-OpenSSH_8.4p1 Debian-5+deb11u3",
+		"SSH-2.0-OpenSSH_8.4p1 Debian-5+deb11u1",
+	},
+	"12": {
+		"SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u2",
+		"SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u1",
+	},
 }
 
 // cpuModel carries everything /proc/cpuinfo has to keep consistent with the
@@ -308,7 +329,7 @@ func Derive(seed string) *Personality {
 		p.BootTime = kern.Released.Add(time.Duration(r.Int63n(int64(span))))
 	}
 
-	p.SSHBanner = pickBanner(r)
+	p.SSHBanner = pickBanner(r, distro)
 	p.SSHVersion = strings.TrimPrefix(p.SSHBanner, "SSH-2.0-")
 	p.Users = deriveUsers(r, distro)
 	p.Packages = derivePackages(r)
@@ -330,19 +351,15 @@ func deriveMAC(r *rand.Rand) string {
 		o[0], o[1], o[2], r.Intn(256), r.Intn(256), r.Intn(256))
 }
 
-func pickBanner(r *rand.Rand) string {
-	total := 0
-	for _, b := range sshBanners {
-		total += b.weight
+// pickBanner returns an OpenSSH version string that belongs to the given
+// release. Falls back to the 8.2 Ubuntu build, which is the version the
+// algorithm tables model most closely.
+func pickBanner(r *rand.Rand, d Distro) string {
+	banners, ok := bannersByDistro[d.VersionID]
+	if !ok || len(banners) == 0 {
+		return "SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.11"
 	}
-	n := r.Intn(total)
-	for _, b := range sshBanners {
-		n -= b.weight
-		if n < 0 {
-			return b.banner
-		}
-	}
-	return sshBanners[0].banner
+	return banners[r.Intn(len(banners))]
 }
 
 func deriveUsers(r *rand.Rand, d Distro) []User {
