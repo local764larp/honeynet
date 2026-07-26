@@ -9,7 +9,9 @@ package sshd
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -27,6 +29,7 @@ import (
 	gossh "golang.org/x/crypto/ssh"
 
 	pb "github.com/honeynet/node/gen/honeynet/v1"
+	"github.com/honeynet/node/internal/credentials"
 	"github.com/honeynet/node/internal/personality"
 	"github.com/honeynet/node/internal/session"
 	"github.com/honeynet/node/internal/shell"
@@ -38,7 +41,6 @@ type ctxKey string
 const (
 	ctxKeySniff     ctxKey = "honeynet.sniff"
 	ctxKeyRecorder  ctxKey = "honeynet.recorder"
-	ctxKeyAttempts  ctxKey = "honeynet.attempts"
 	ctxKeyEndReason ctxKey = "honeynet.end_reason"
 )
 
@@ -49,9 +51,15 @@ type Config struct {
 	// while the node ID must match the CN of the client certificate the
 	// collector authenticated. Conflating them would let a seed change silently
 	// break collector-side identity validation.
-	NodeID           string
-	Addr             string
-	HostKeyPath      string
+	NodeID      string
+	Addr        string
+	HostKeyPath string
+
+	// CredentialSecret keys the node's accepted logins. Distinct from both the
+	// node ID and the personality seed, which are provisioning inputs and
+	// therefore guessable; see the credentials package.
+	CredentialSecret string
+
 	MaxSessions      int
 	MaxSessionsPerIP int
 	IdleTimeout      time.Duration
@@ -66,6 +74,9 @@ type Server struct {
 	log    *slog.Logger
 	notify func()
 
+	policy  *credentials.Policy
+	profile profile
+
 	srv *gliderssh.Server
 
 	mu        sync.Mutex
@@ -77,9 +88,20 @@ type Server struct {
 // New constructs the listener. notify is called after each emitted event so the
 // publisher can drain promptly rather than waiting for its poll tick.
 func New(cfg Config, p *personality.Personality, sink session.Sink, log *slog.Logger, notify func()) (*Server, error) {
+	if cfg.CredentialSecret == "" {
+		return nil, fmt.Errorf("credential secret is required")
+	}
+
 	s := &Server{
 		cfg: cfg, p: p, sink: sink, log: log, notify: notify,
 		perIP: map[string]int{},
+
+		// One password per account, derived from the node secret and drawn
+		// from the wordlists attackers actually spray. The roster comes from
+		// the personality so that what authenticates and what appears in
+		// /etc/passwd cannot disagree.
+		policy:  credentials.NewPolicy(cfg.CredentialSecret, credentials.AccountsFrom(p.AccountNames())),
+		profile: profileFor(p.SSHBanner),
 	}
 
 	signers, err := loadOrCreateHostKeys(cfg.HostKeyPath)
@@ -94,6 +116,13 @@ func New(cfg Config, p *personality.Personality, sink session.Sink, log *slog.Lo
 		// advertised OpenSSH build matches the distribution the emulated shell
 		// claims to be running.
 		Version: versionSuffix(p.SSHBanner),
+
+		// Pins the advertised algorithms to that same release. Without this
+		// gliderlabs hands x/crypto a zero-value config, and the library's own
+		// defaults contradict the banner in the first packet of the handshake.
+		ServerConfigCallback: func(gliderssh.Context) *gossh.ServerConfig {
+			return s.profile.serverConfig()
+		},
 
 		IdleTimeout: cfg.IdleTimeout,
 		MaxTimeout:  cfg.MaxDuration,
@@ -261,14 +290,21 @@ func peerFrom(remote, local net.Addr) *pb.Peer {
 	return p
 }
 
+// handlePassword authenticates against the node's fixed credential set.
+//
+// Admission depends only on the credential, never on how many times it has been
+// tried. The earlier implementation granted access once an attacker had failed
+// a threshold number of times, which identified the sensor in one connection:
+// six random strings, and one of them opens a shell. Nothing on the internet
+// behaves that way.
+//
+// The door still opens, but through the credential rather than through
+// persistence -- see the credentials package for how the node's password is
+// drawn from the same lists the botnets are working through.
 func (s *Server) handlePassword(ctx gliderssh.Context, password string) bool {
 	r := s.recorderFor(ctx)
 
-	attempts, _ := ctx.Value(ctxKeyAttempts).(int)
-	attempts++
-	ctx.SetValue(ctxKeyAttempts, attempts)
-
-	granted := s.acceptCredential(ctx.User(), password, attempts)
+	granted := s.policy.Accept(ctx.User(), password)
 	r.AuthAttempt(pb.AuthMethod_AUTH_METHOD_PASSWORD, ctx.User(), password, granted)
 	s.notify()
 
@@ -415,17 +451,28 @@ func (s *Server) release(ip string) {
 // Persistence is not optional. A host key that changes between restarts is
 // immediately visible to any scanner that revisits, and revisits are common --
 // the same botnets sweep the same ranges continuously.
+// The key set mirrors what ssh-keygen -A leaves in /etc/ssh on a stock install:
+// RSA, ECDSA and Ed25519. The previous pair -- RSA-2048 and Ed25519 -- was
+// visibly wrong in two ways at once, both readable without authenticating:
+//
+//	ssh-keyscan -t rsa,ecdsa,ed25519 host
+//
+// A missing ECDSA key means a host that was never initialised by ssh-keygen -A,
+// and a 2048-bit RSA modulus means one initialised by something other than a
+// modern OpenSSH, which has defaulted to 3072 since 8.0.
 func loadOrCreateHostKeys(path string) ([]gossh.Signer, error) {
 	if path == "" {
 		return nil, fmt.Errorf("host key path is required")
 	}
 
 	var signers []gossh.Signer
+	// Order matches the sequence sshd offers host key algorithms in.
 	for _, spec := range []struct {
 		suffix string
 		gen    func() ([]byte, error)
 	}{
-		{"", generateRSAKey},
+		{"_rsa", generateRSAKey},
+		{"_ecdsa", generateECDSAKey},
 		{"_ed25519", generateEd25519Key},
 	} {
 		p := path + spec.suffix
@@ -451,8 +498,11 @@ func loadOrCreateHostKeys(path string) ([]gossh.Signer, error) {
 	return signers, nil
 }
 
+// generateRSAKey produces a 3072-bit key, which is what ssh-keygen -A has
+// produced since OpenSSH 8.0. The modulus size is visible to ssh-keyscan
+// without authenticating.
 func generateRSAKey() ([]byte, error) {
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	key, err := rsa.GenerateKey(rand.Reader, 3072)
 	if err != nil {
 		return nil, fmt.Errorf("generate rsa host key: %w", err)
 	}
@@ -460,6 +510,20 @@ func generateRSAKey() ([]byte, error) {
 		Type:  "RSA PRIVATE KEY",
 		Bytes: x509.MarshalPKCS1PrivateKey(key),
 	}), nil
+}
+
+// generateECDSAKey produces the P-256 key ssh-keygen -A creates. Its absence
+// was the more visible of the two host key defects.
+func generateECDSAKey() ([]byte, error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("generate ecdsa host key: %w", err)
+	}
+	der, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		return nil, fmt.Errorf("marshal ecdsa host key: %w", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der}), nil
 }
 
 func generateEd25519Key() ([]byte, error) {

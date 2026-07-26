@@ -20,6 +20,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/honeynet/node/internal/config"
+	"github.com/honeynet/node/internal/credentials"
 	"github.com/honeynet/node/internal/personality"
 	"github.com/honeynet/node/internal/protocols/rdp"
 	"github.com/honeynet/node/internal/protocols/sshd"
@@ -41,6 +42,7 @@ func main() {
 		showIdent    = flag.Bool("identity", false, "print the derived machine identity and exit")
 		showVersion  = flag.Bool("version", false, "print version and exit")
 		honeyfileDir = flag.String("honeyfiles", "", "generate canary honeyfiles into this directory and exit")
+		showCreds    = flag.Bool("credentials", false, "print the logins this node accepts and exit")
 	)
 	flag.Parse()
 
@@ -63,6 +65,24 @@ func main() {
 		return
 	}
 
+	if *showCreds {
+		if err := printCredentials(cfg, p); err != nil {
+			fmt.Fprintln(os.Stderr, "credentials:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// Loaded after the --show-ident branch so the secret is never present on
+	// the code path that prints the identity, and before the honeyfile branch
+	// because planted files carry canary tokens keyed on it.
+	secret, err := credentials.LoadOrCreateSecret(cfg.CredentialSecretPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "credential secret:", err)
+		os.Exit(1)
+	}
+	p.TokenSecret = secret
+
 	if *honeyfileDir != "" {
 		if err := generateHoneyfiles(cfg, p, *honeyfileDir); err != nil {
 			fmt.Fprintln(os.Stderr, "honeyfiles:", err)
@@ -71,13 +91,13 @@ func main() {
 		return
 	}
 
-	if err := run(cfg, p, log); err != nil {
+	if err := run(cfg, p, secret, log); err != nil {
 		log.Error("node exited with error", "err", err)
 		os.Exit(1)
 	}
 }
 
-func run(cfg config.Config, p *personality.Personality, log *slog.Logger) error {
+func run(cfg config.Config, p *personality.Personality, secret string, log *slog.Logger) error {
 	log.Info("honeynode starting",
 		"version", buildVersion,
 		"node_id", cfg.NodeID,
@@ -122,6 +142,7 @@ func run(cfg config.Config, p *personality.Personality, log *slog.Logger) error 
 			NodeID:           cfg.NodeID,
 			Addr:             cfg.SSHAddr,
 			HostKeyPath:      cfg.HostKeyPath,
+			CredentialSecret: secret,
 			MaxSessions:      cfg.MaxSessions,
 			MaxSessionsPerIP: cfg.MaxSessionsPerIP,
 			IdleTimeout:      cfg.SessionIdleTimeout,
@@ -143,6 +164,7 @@ func run(cfg config.Config, p *personality.Personality, log *slog.Logger) error 
 		srv := telnet.New(telnet.Config{
 			NodeID:           cfg.NodeID,
 			Addr:             cfg.TelnetAddr,
+			CredentialSecret: secret,
 			MaxSessions:      cfg.MaxSessions,
 			MaxSessionsPerIP: cfg.MaxSessionsPerIP,
 			IdleTimeout:      cfg.SessionIdleTimeout,
@@ -161,6 +183,7 @@ func run(cfg config.Config, p *personality.Personality, log *slog.Logger) error 
 		srv := web.New(web.Config{
 			NodeID:           cfg.NodeID,
 			Addr:             cfg.HTTPAddr,
+			CredentialSecret: secret,
 			SessionIdle:      cfg.SessionIdleTimeout,
 			MaxSessions:      cfg.MaxSessions,
 			MaxSessionsPerIP: cfg.MaxSessionsPerIP,
@@ -315,4 +338,34 @@ func printIdentity(p *personality.Personality) {
 		fmt.Printf("%s(%d)", u.Name, u.UID)
 	}
 	fmt.Printf("\npackages:  %d installed\n", len(p.Packages))
+}
+
+// printCredentials lists the logins the node accepts.
+//
+// The sensor accepts exactly one password per account and derives it from a
+// secret only it holds, so there is otherwise no way to find out what it is --
+// not for an attacker, which is the point, but also not for the operator who
+// needs to reach their own sensor or drive an end-to-end run against it.
+//
+// Local and explicit: it reads the node's own secret off disk and is only
+// reachable by someone who already has that file. It is deliberately not part
+// of --show-ident, which is routine output that gets pasted into tickets.
+func printCredentials(cfg config.Config, p *personality.Personality) error {
+	secret, err := credentials.LoadOrCreateSecret(cfg.CredentialSecretPath)
+	if err != nil {
+		return fmt.Errorf("credential secret: %w", err)
+	}
+	pol := credentials.NewPolicy(secret, credentials.AccountsFrom(p.AccountNames()))
+
+	for _, account := range pol.Accounts() {
+		pw, ok := pol.PasswordFor(account)
+		if !ok {
+			continue
+		}
+		if pw == "" {
+			pw = "(empty)"
+		}
+		fmt.Printf("%s:%s\n", account, pw)
+	}
+	return nil
 }

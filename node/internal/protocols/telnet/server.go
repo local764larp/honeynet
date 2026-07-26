@@ -25,6 +25,7 @@ import (
 	"github.com/honeynet/node/internal/personality"
 	"github.com/honeynet/node/internal/session"
 	"github.com/honeynet/node/internal/shell"
+	"github.com/honeynet/node/internal/credentials"
 	"github.com/honeynet/node/internal/vfs"
 )
 
@@ -48,14 +49,25 @@ const (
 type Config struct {
 	// NodeID is stamped into every emitted envelope. Carried separately from
 	// the personality seed -- see the note on sshd.Config.
-	NodeID           string
-	Addr             string
+	NodeID string
+	Addr   string
+
+	// CredentialSecret keys the node's accepted logins, shared with the SSH
+	// listener so that one box does not have two different password sets.
+	CredentialSecret string
+
 	MaxSessions      int
 	MaxSessionsPerIP int
 	IdleTimeout      time.Duration
 	MaxDuration      time.Duration
+
 	// MaxAuthAttempts is how many login prompts a client gets before the node
-	// lets it in regardless. Telnet loaders typically try two or three pairs.
+	// hangs up, matching login(1), which gives up after three.
+	//
+	// It used to be the count after which the node admitted the client
+	// regardless of what they typed. That made persistence alone sufficient to
+	// get a shell, which is not a property any real system has and which a
+	// scanner confirms by typing garbage three times.
 	MaxAuthAttempts int
 }
 
@@ -66,6 +78,8 @@ type Server struct {
 	sink   session.Sink
 	log    *slog.Logger
 	notify func()
+
+	policy *credentials.Policy
 
 	mu    sync.Mutex
 	perIP map[string]int
@@ -79,7 +93,15 @@ func New(cfg Config, p *personality.Personality, sink session.Sink, log *slog.Lo
 	if cfg.MaxAuthAttempts <= 0 {
 		cfg.MaxAuthAttempts = 3
 	}
-	return &Server{cfg: cfg, p: p, sink: sink, log: log, notify: notify, perIP: map[string]int{}}
+	return &Server{
+		cfg: cfg, p: p, sink: sink, log: log, notify: notify,
+		perIP: map[string]int{},
+
+		// Same roster and same secret as the SSH listener: a box has one set
+		// of accounts, and a password that works on port 22 but not on port 23
+		// is a contradiction worth nothing to us and everything to a scanner.
+		policy: credentials.NewPolicy(cfg.CredentialSecret, credentials.AccountsFrom(p.AccountNames())),
+	}
 }
 
 // ListenAndServe runs until the context is cancelled.
@@ -209,7 +231,7 @@ func (s *Server) authenticate(tc *telnetConn, r *session.Recorder) (string, bool
 			return "", false
 		}
 
-		granted := attempt >= s.cfg.MaxAuthAttempts
+		granted := s.policy.Accept(user, pass)
 		r.AuthAttempt(pb.AuthMethod_AUTH_METHOD_PASSWORD, user, pass, granted)
 		s.notify()
 
@@ -220,6 +242,14 @@ func (s *Server) authenticate(tc *telnetConn, r *session.Recorder) (string, bool
 
 		time.Sleep(session.Jitter(s.p.AuthFailBaseMS, s.p.AuthFailJitterMS))
 		fmt.Fprintf(tc, "\r\nLogin incorrect\r\n")
+
+		// login(1) gives up rather than prompting forever. Prompting forever
+		// is both unlike a real system and an invitation to sit on the socket
+		// running a wordlist through it.
+		if attempt >= s.cfg.MaxAuthAttempts {
+			fmt.Fprintf(tc, "\r\nMaximum number of tries exceeded (%d)\r\n", s.cfg.MaxAuthAttempts)
+			return "", false
+		}
 	}
 }
 

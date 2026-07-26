@@ -1,4 +1,4 @@
-package web
+﻿package web
 
 import (
 	"archive/zip"
@@ -60,29 +60,29 @@ func ParseCanaryToken(path string) (string, bool) {
 // us someone is scanning, and a hit on the embedded URL tells us they parsed
 // and acted on the contents, which is a much stronger signal.
 func dotenvBody(p *personality.Personality, host string) string {
-	tok := Token(p.Seed, "dotenv")
+	tok := Token(p.TokenSecret, "dotenv")
 	var b strings.Builder
 	b.WriteString("APP_NAME=Laravel\n")
 	b.WriteString("APP_ENV=production\n")
-	fmt.Fprintf(&b, "APP_KEY=base64:%s\n", Token(p.Seed, "appkey")+Token(p.Seed, "appkey2")+"aGVsbG89")
+	fmt.Fprintf(&b, "APP_KEY=base64:%s\n", Token(p.TokenSecret, "appkey")+Token(p.TokenSecret, "appkey2")+"aGVsbG89")
 	b.WriteString("APP_DEBUG=false\n")
 	fmt.Fprintf(&b, "APP_URL=http://%s\n\n", p.Hostname)
 	b.WriteString("LOG_CHANNEL=stack\nLOG_LEVEL=error\n\n")
 	b.WriteString("DB_CONNECTION=mysql\nDB_HOST=127.0.0.1\nDB_PORT=3306\n")
 	b.WriteString("DB_DATABASE=app_production\nDB_USERNAME=app_rw\n")
-	fmt.Fprintf(&b, "DB_PASSWORD=%s\n\n", Token(p.Seed, "dbpass"))
+	fmt.Fprintf(&b, "DB_PASSWORD=%s\n\n", Token(p.TokenSecret, "dbpass"))
 	b.WriteString("CACHE_DRIVER=redis\nQUEUE_CONNECTION=redis\nSESSION_DRIVER=redis\n")
 	b.WriteString("REDIS_HOST=127.0.0.1\nREDIS_PORT=6379\n\n")
-	fmt.Fprintf(&b, "AWS_ACCESS_KEY_ID=AKIA%s\n", strings.ToUpper(Token(p.Seed, "awskey")[:16]))
-	fmt.Fprintf(&b, "AWS_SECRET_ACCESS_KEY=%s\n", Token(p.Seed, "awssecret")+Token(p.Seed, "awssecret2")+"wJal")
+	fmt.Fprintf(&b, "AWS_ACCESS_KEY_ID=AKIA%s\n", strings.ToUpper(Token(p.TokenSecret, "awskey")[:16]))
+	fmt.Fprintf(&b, "AWS_SECRET_ACCESS_KEY=%s\n", Token(p.TokenSecret, "awssecret")+Token(p.TokenSecret, "awssecret2")+"wJal")
 	b.WriteString("AWS_DEFAULT_REGION=us-east-1\n")
 	b.WriteString("AWS_BUCKET=acme-prod-assets\n\n")
 	b.WriteString("MAIL_MAILER=smtp\nMAIL_HOST=smtp.mailgun.org\nMAIL_PORT=587\n")
 	b.WriteString("MAIL_USERNAME=postmaster@acme-internal.example\n")
-	fmt.Fprintf(&b, "MAIL_PASSWORD=%s\n\n", Token(p.Seed, "mailpass"))
+	fmt.Fprintf(&b, "MAIL_PASSWORD=%s\n\n", Token(p.TokenSecret, "mailpass"))
 	// The tripwire: a plausible internal asset endpoint on this same host.
 	fmt.Fprintf(&b, "ASSET_URL=%s\n", CanaryURL(host, tok))
-	fmt.Fprintf(&b, "SENTRY_LARAVEL_DSN=https://%s@o447951.ingest.sentry.io/5428537\n", Token(p.Seed, "sentry"))
+	fmt.Fprintf(&b, "SENTRY_LARAVEL_DSN=https://%s@o447951.ingest.sentry.io/5428537\n", Token(p.TokenSecret, "sentry"))
 	return b.String()
 }
 

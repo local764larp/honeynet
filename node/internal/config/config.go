@@ -40,6 +40,17 @@ type Config struct {
 	// glaring tell to any scanner that revisits.
 	HostKeyPath string `json:"host_key_path"`
 
+	// CredentialSecretPath holds the node's private credential secret, which
+	// keys both the accepted logins and the canary tokens. Generated on first
+	// start if absent, and persisted for the same reason as the host key.
+	//
+	// Kept separate from NodeID and PersonalitySeed on purpose. Those are
+	// provisioning inputs -- the ID is in the certificate CN and travels with
+	// every envelope, and the seed is frequently derived from it -- so deriving
+	// secrets from either would let anyone who identifies one sensor compute
+	// the logins and tokens of the whole fleet.
+	CredentialSecretPath string `json:"credential_secret_path"`
+
 	MaxSessions        int           `json:"max_sessions"`
 	MaxSessionsPerIP   int           `json:"max_sessions_per_ip"`
 	SessionIdleTimeout time.Duration `json:"-"`
@@ -75,6 +86,9 @@ func Default() Config {
 		HTTPAddr:         ":8080",
 		RDPAddr:          "",
 		HostKeyPath:      "honeynode_host_key",
+
+		CredentialSecretPath: "honeynode_credentials.secret",
+
 		MaxSessions:      256,
 		MaxSessionsPerIP: 8,
 		IdleTimeoutSec:   180,
@@ -139,6 +153,7 @@ func applyEnv(cfg *Config) {
 	str("HONEYNODE_HTTP_ADDR", &cfg.HTTPAddr)
 	str("HONEYNODE_RDP_ADDR", &cfg.RDPAddr)
 	str("HONEYNODE_HOST_KEY", &cfg.HostKeyPath)
+	str("HONEYNODE_CREDENTIAL_SECRET", &cfg.CredentialSecretPath)
 	str("HONEYNODE_CALLBACK_HOST", &cfg.CallbackHost)
 	str("HONEYNODE_LOG_LEVEL", &cfg.LogLevel)
 	num("HONEYNODE_MAX_SESSIONS", &cfg.MaxSessions)
@@ -162,6 +177,9 @@ func (c Config) Validate() error {
 	}
 	if c.SpoolPath == "" {
 		return fmt.Errorf("spool_path is required")
+	}
+	if c.CredentialSecretPath == "" {
+		return fmt.Errorf("credential_secret_path is required")
 	}
 	if c.SSHAddr == "" && c.TelnetAddr == "" && c.HTTPAddr == "" && c.RDPAddr == "" {
 		return fmt.Errorf("at least one protocol listener must be configured")

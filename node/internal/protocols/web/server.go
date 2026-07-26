@@ -38,6 +38,11 @@ type Config struct {
 	NodeID string
 	Addr   string
 
+	// CredentialSecret keys the canary tokens. Must be the same value that was
+	// assigned to the personality's TokenSecret, or the tokens planted in the
+	// decoy files will not be the tokens this server recognises on callback.
+	CredentialSecret string
+
 	// SessionIdle groups requests from one source into a single session.
 	// HTTP is stateless, but scanners are not: a sweep of forty paths from one
 	// address is one interaction, and recording it as forty unrelated sessions
@@ -87,7 +92,7 @@ func New(cfg Config, p *personality.Personality, sink session.Sink, log *slog.Lo
 	return &Server{
 		cfg: cfg, p: p, sink: sink, log: log, notify: notify,
 		decoys:   Decoys(),
-		tokens:   KnownTokens(p.Seed),
+		tokens:   KnownTokens(cfg.CredentialSecret),
 		sessions: map[string]*liveSession{},
 	}
 }
@@ -159,12 +164,35 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	return s.Serve(ctx, ln)
 }
 
-func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
+// handle answers one request.
+//
+// The response is built into an orderedWriter and only then put on the wire, so
+// the header sequence matches the server being impersonated rather than the
+// alphabetical order net/http would produce. See headers.go.
+func (s *Server) handle(rw http.ResponseWriter, r *http.Request) {
+	ow := newOrderedWriter()
+	var w http.ResponseWriter = ow
+
 	defer func() {
 		// Scanners send deliberately malformed requests. A panic in one
 		// handler must not take the sensor down.
 		if rec := recover(); rec != nil {
 			s.log.Error("http handler panicked", "recovered", rec, "path", r.URL.Path)
+		}
+
+		// Emit whatever was built, even on the panic path -- a scanner that
+		// tripped a bug must still get a response, or the silence is itself
+		// the signal.
+		if !ow.writeOrdered(rw, r, serverHeader(s.p)) {
+			// Connection could not be hijacked. A correct response in the
+			// wrong header order beats no response.
+			for name, values := range ow.Header() {
+				for _, v := range values {
+					rw.Header().Add(name, v)
+				}
+			}
+			rw.WriteHeader(ow.status)
+			_, _ = rw.Write(ow.body.Bytes())
 		}
 	}()
 

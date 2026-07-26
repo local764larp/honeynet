@@ -16,6 +16,7 @@ import (
 	gossh "golang.org/x/crypto/ssh"
 
 	pb "github.com/honeynet/node/gen/honeynet/v1"
+	"github.com/honeynet/node/internal/credentials"
 	"github.com/honeynet/node/internal/personality"
 	"github.com/honeynet/node/internal/protocols/sshd"
 )
@@ -43,6 +44,27 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 }
 
+// testSecret keys the credential set for every server these tests start. Fixed
+// rather than random so that a failure is reproducible.
+const testSecret = "test-credential-secret-0123456789abcdef"
+
+// validPassword returns the one password that authenticates for an account on
+// a node built from p.
+//
+// Tests have to ask, because there is no longer a way to get in without
+// knowing: admission is an exact match against this value and no amount of
+// retrying substitutes for it.
+func validPassword(t *testing.T, p *personality.Personality, account string) string {
+	t.Helper()
+
+	pol := credentials.NewPolicy(testSecret, credentials.AccountsFrom(p.AccountNames()))
+	pw, ok := pol.PasswordFor(account)
+	if !ok {
+		t.Fatalf("account %q is not on this node (roster: %v)", account, p.AccountNames())
+	}
+	return pw
+}
+
 // startServer brings up a honeypot SSH listener on an ephemeral port.
 func startServer(t *testing.T, seed string) (addr string, sink *memSink, p *personality.Personality) {
 	t.Helper()
@@ -54,6 +76,7 @@ func startServer(t *testing.T, seed string) (addr string, sink *memSink, p *pers
 		NodeID:           "test-node",
 		Addr:             "127.0.0.1:0",
 		HostKeyPath:      filepath.Join(t.TempDir(), "hostkey"),
+		CredentialSecret: testSecret,
 		MaxSessions:      16,
 		MaxSessionsPerIP: 8,
 		IdleTimeout:      10 * time.Second,
@@ -86,8 +109,12 @@ func startServer(t *testing.T, seed string) (addr string, sink *memSink, p *pers
 	return srv.Addr(), sink, p
 }
 
-// dial authenticates as the honeypot expects: repeated password attempts until
-// the node grants access.
+// dial offers each password in turn until one authenticates.
+//
+// The last entry has to be the account's real password. Retrying no longer
+// gets anyone in on its own -- that behaviour was the sensor's loudest
+// fingerprint and TestRandomCredentialsNeverAuthenticate in the credentials
+// package asserts it is gone.
 func dial(t *testing.T, addr, user string, passwords []string) *gossh.Client {
 	t.Helper()
 
@@ -113,6 +140,61 @@ func dial(t *testing.T, addr, user string, passwords []string) *gossh.Client {
 	return client
 }
 
+// TestUMACModesCompleteRealSessions is the proof that the forked MAC actually
+// works, as opposed to merely being advertised.
+//
+// The algorithm test asserts what the server offers; this one forces the client
+// to negotiate each UMAC mode and then pushes command output through it. Both
+// ends compute the tag independently, so a wrong implementation cannot produce
+// a completed session -- it fails the handshake or corrupts the first packet.
+//
+// Exercising all four matters because they split two ways: encrypt-then-MAC
+// versus MAC-then-encrypt changes what the transport feeds the hash, and the
+// 64- and 128-bit tags take different pad slices out of the same AES block.
+func TestUMACModesCompleteRealSessions(t *testing.T) {
+	for _, mac := range []string{
+		gossh.UMAC64ETM,
+		gossh.UMAC128ETM,
+		gossh.UMAC64,
+		gossh.UMAC128,
+	} {
+		t.Run(mac, func(t *testing.T) {
+			addr, _, p := startServer(t, "umac-"+mac)
+			password := validPassword(t, p, "root")
+
+			cfg := &gossh.ClientConfig{
+				User:            "root",
+				Auth:            []gossh.AuthMethod{gossh.Password(password)},
+				HostKeyCallback: gossh.InsecureIgnoreHostKey(), //nolint:gosec // our own test honeypot
+				Timeout:         15 * time.Second,
+			}
+			cfg.MACs = []string{mac}
+
+			client, err := gossh.Dial("tcp", addr, cfg)
+			if err != nil {
+				t.Fatalf("dial with %s: %v", mac, err)
+			}
+			defer func() { _ = client.Close() }()
+
+			sess, err := client.NewSession()
+			if err != nil {
+				t.Fatalf("new session with %s: %v", mac, err)
+			}
+			defer func() { _ = sess.Close() }()
+
+			// Output large enough to span several packets, so the MAC is
+			// exercised on real traffic rather than only on the handshake.
+			out, err := sess.CombinedOutput("cat /etc/passwd; uname -a; cat /proc/cpuinfo")
+			if err != nil {
+				t.Fatalf("command under %s: %v", mac, err)
+			}
+			if len(out) == 0 {
+				t.Errorf("no output under %s", mac)
+			}
+		})
+	}
+}
+
 func firstEvent[T any](envs []*pb.Envelope, extract func(*pb.Envelope) (T, bool)) (T, bool) {
 	var zero T
 	for _, e := range envs {
@@ -128,7 +210,7 @@ func firstEvent[T any](envs []*pb.Envelope, extract func(*pb.Envelope) (T, bool)
 func TestSSHSessionEndToEnd(t *testing.T) {
 	addr, sink, p := startServer(t, "e2e-node")
 
-	client := dial(t, addr, "root", []string{"wrongpass", "alsowrong", "123456", "admin", "root"})
+	client := dial(t, addr, "root", []string{"wrongpass", "alsowrong", validPassword(t, p, "root")})
 
 	sess, err := client.NewSession()
 	if err != nil {
@@ -273,7 +355,8 @@ func TestSSHSessionEndToEnd(t *testing.T) {
 // TestPublicKeyIsRecordedAndDeclined confirms the deliberate choice to decline
 // key auth so that the client falls back and discloses its password list.
 func TestPublicKeyIsRecordedAndDeclined(t *testing.T) {
-	addr, sink, _ := startServer(t, "pubkey-node")
+	addr, sink, p := startServer(t, "pubkey-node")
+	password := validPassword(t, p, "root")
 
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -291,7 +374,7 @@ func TestPublicKeyIsRecordedAndDeclined(t *testing.T) {
 			gossh.PublicKeys(signer),
 			gossh.RetryableAuthMethod(gossh.PasswordCallback(func() (string, error) {
 				attempt++
-				return "hunter2", nil
+				return password, nil
 			}), 8),
 		},
 		HostKeyCallback: gossh.InsecureIgnoreHostKey(), //nolint:gosec // our own test honeypot
@@ -325,8 +408,8 @@ func TestPublicKeyIsRecordedAndDeclined(t *testing.T) {
 			}
 		case pb.AuthMethod_AUTH_METHOD_PASSWORD:
 			sawPassword = true
-			if a.Password != "hunter2" {
-				t.Errorf("captured password = %q, want hunter2", a.Password)
+			if a.Password != password {
+				t.Errorf("captured password = %q, want %q", a.Password, password)
 			}
 		}
 	}
@@ -341,9 +424,11 @@ func TestPublicKeyIsRecordedAndDeclined(t *testing.T) {
 // TestNodeStartsWithoutCollector confirms a sensor still records when the
 // collector is unreachable, which is exactly when interesting things happen.
 func TestNodeStartsWithoutCollector(t *testing.T) {
-	addr, sink, _ := startServer(t, "offline-node")
+	addr, sink, p := startServer(t, "offline-node")
 
-	client := dial(t, addr, "admin", []string{"a", "b", "c", "d", "e", "f"})
+	// root rather than admin: every personality has root, but the rest of the
+	// roster is derived and admin may not be on this node.
+	client := dial(t, addr, "root", []string{validPassword(t, p, "root")})
 	sess, err := client.NewSession()
 	if err != nil {
 		t.Fatalf("new session: %v", err)

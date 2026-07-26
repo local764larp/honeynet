@@ -247,14 +247,22 @@ func startWeb(t *testing.T, seed string) (string, *memSink) {
 	t.Helper()
 
 	sink := &memSink{}
+	// Canary tokens key on the node's credential secret rather than its
+	// personality seed, so that a public node ID cannot be used to precompute
+	// the fleet's tokens. The tests pass the seed as the secret so the token
+	// values they assert on stay stable.
+	p := personality.Derive(seed)
+	p.TokenSecret = seed
+
 	srv := web.New(web.Config{
 		NodeID:           "test-node",
 		Addr:             "127.0.0.1:0",
+		CredentialSecret: seed,
 		SessionIdle:      time.Minute,
 		MaxSessions:      32,
 		MaxSessionsPerIP: 16,
 		CallbackHost:     "sensor.example",
-	}, personality.Derive(seed), sink,
+	}, p, sink,
 		slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError})),
 		func() {})
 
