@@ -86,7 +86,7 @@ func TestParseConnectionRequestToleratesMalformedInput(t *testing.T) {
 		{0x03, 0x00, 0x00},
 		{0x03, 0x00, 0x00, 0x2c, 0xff},
 		[]byte("garbage that is not a PDU at all"),
-		append(buildCR("trunc", protoHybrid, true)[:9]),
+		buildCR("trunc", protoHybrid, true)[:9],
 		{0x03, 0x00, 0xff, 0xff, 0x06, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00},
 	}
 	for i, in := range inputs {

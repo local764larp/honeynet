@@ -120,8 +120,24 @@ try {
     Wait-ForPort -Port $SshPort -What 'honeynode ssh'
 
     # ------------------------------------------------------- traffic ----
+    #
+    # The sensor accepts one password per account, derived from a secret only
+    # it holds, so no wordlist reaches a shell -- that is the whole point of
+    # the credential design. The harness therefore has to ask the node what it
+    # accepts, or every profile would stop at the login and nothing downstream
+    # of authentication would ever be exercised.
+    #
+    # The simulator still sprays its own guesses first; the real credential is
+    # offered last, inside the server's auth-try budget.
+    $credLine = (& $nodeExe -config (Join-Path $WorkDir 'nonexistent.json') -credentials |
+        Where-Object { $_ -like 'root:*' } | Select-Object -First 1)
+    if (-not $credLine) { throw "could not read the node's accepted credentials" }
+    $simUser, $simPass = $credLine -split ':', 2
+    Write-Host "  sensor accepts ${simUser}:${simPass}" -ForegroundColor DarkGray
+
     Write-Host "`nreplaying attacker profiles" -ForegroundColor Cyan
-    & $simExe -addr "127.0.0.1:$SshPort" -runs $Runs -parallel $Parallel -seed 20260725
+    & $simExe -addr "127.0.0.1:$SshPort" -runs $Runs -parallel $Parallel -seed 20260725 `
+        -username $simUser -password $simPass
     $simExit = $LASTEXITCODE
 
     # Let the sensor's publisher drain its spool.

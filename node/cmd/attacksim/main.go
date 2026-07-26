@@ -57,7 +57,14 @@ var profiles = []Profile{
 	{
 		Name:          "mirai-loader",
 		ClientVersion: "SSH-2.0-libssh2_1.4.3",
-		KeyExchanges:  []string{"diffie-hellman-group14-sha1", "diffie-hellman-group1-sha1"},
+		// Legacy-leaning, but not legacy-only. A client offering nothing but
+		// group1-sha1 and group14-sha1 cannot reach any current server:
+		// OpenSSH disabled both by default in 7.0, so a real sensor claiming
+		// 8.2 rejects it and so does most of the internet. Real surviving
+		// loaders carry a modern exchange alongside the old ones, which is
+		// what keeps them working. The SHA-1 entries stay because they are
+		// what make this profile's HASSH distinct.
+		KeyExchanges:  []string{"diffie-hellman-group14-sha1", "diffie-hellman-group1-sha1", "diffie-hellman-group14-sha256"},
 		Ciphers:       []string{"aes128-ctr", "aes192-ctr", "aes256-ctr"},
 		MACs:          []string{"hmac-sha1", "hmac-sha1-96"},
 		Usernames:     []string{"root", "admin", "root"},
@@ -180,8 +187,34 @@ func main() {
 		parallel = flag.Int("parallel", 1, "concurrent sessions")
 		list     = flag.Bool("list", false, "list profiles and exit")
 		seed     = flag.Int64("seed", time.Now().UnixNano(), "rng seed for reproducible corpora")
+
+		// The sensor accepts exactly one password per account, derived from a
+		// secret only it holds, so no wordlist gets in. That is the point of
+		// the design -- but it means the harness cannot exercise anything past
+		// the login unless it is told the answer.
+		//
+		// Supplying it here keeps the spray realistic: the profile's own
+		// guesses are tried first and recorded as failures, and this is
+		// offered last, within the server's auth-try budget.
+		password = flag.String("password", "", "credential the sensor actually accepts, for end-to-end runs")
+		username = flag.String("username", "", "account to use with -password")
 	)
 	flag.Parse()
+
+	if *password != "" {
+		for i := range profiles {
+			// Two failures then the real credential: enough to observe a spray
+			// without exceeding sshd's six-attempt limit.
+			guesses := profiles[i].Passwords
+			if len(guesses) > 2 {
+				guesses = guesses[:2]
+			}
+			profiles[i].Passwords = append(append([]string{}, guesses...), *password)
+			if *username != "" {
+				profiles[i].Usernames = []string{*username}
+			}
+		}
+	}
 
 	if *list {
 		for _, p := range profiles {
