@@ -5,14 +5,25 @@
 /ml/*.egg-info/
 __pycache__/
 *.pyc
+node_modules/
+/dashboard/dist/
 
-# end-to-end run artifacts
+# end-to-end and demo run artifacts
 /.e2e/
+/.demo/
 
 # sensor runtime state -- never commit these
 *.spool
 honeynode_host_key*
 /node/gen/**/*.pb.go
+
+# The node's credential secret keys every login it accepts and every canary
+# token it plants. Committing one would hand over the fleet it belongs to.
+*.secret
+honeynode_credentials.secret
+
+# TypeScript incremental build state
+*.tsbuildinfo
 
 # credentials and keys -- the CA key can mint any node identity
 *.pem

@@ -1,0 +1,14 @@
+version: v2
+modules:
+  - path: proto
+lint:
+  use:
+    - STANDARD
+  except:
+    # Our package is honeynet.v1 and files live at honeynet/v1/*.proto, but we
+    # deliberately keep two files (envelope, events) rather than one file per
+    # top-level type.
+    - PACKAGE_DIRECTORY_MATCH
+breaking:
+  use:
+    - FILE

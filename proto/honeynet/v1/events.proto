@@ -1,0 +1,250 @@
+syntax = "proto3";
+
+package honeynet.v1;
+
+import "google/protobuf/duration.proto";
+
+option go_package = "github.com/honeynet/node/gen/honeynet/v1;honeynetv1";
+
+enum Protocol {
+  PROTOCOL_UNSPECIFIED = 0;
+  PROTOCOL_SSH         = 1;
+  PROTOCOL_TELNET      = 2;
+  PROTOCOL_HTTP        = 3;
+  PROTOCOL_HTTPS       = 4;
+  PROTOCOL_RDP         = 5;
+  PROTOCOL_CANARY      = 6;
+}
+
+// Peer is the remote end of a connection. Kept as a distinct message because
+// every enrichment stage (geo, ASN, reputation) keys off it.
+message Peer {
+  string src_ip   = 1;
+  uint32 src_port = 2;
+  string dst_ip   = 3;
+  uint32 dst_port = 4;
+}
+
+message SessionStart {
+  Protocol protocol = 1;
+  Peer     peer     = 2;
+
+  // Protocol-level client identification, before any authentication.
+  // For SSH this is the client version string ("SSH-2.0-libssh2_1.9.0"), which
+  // is one of the strongest bot-family fingerprints available.
+  string client_banner = 3;
+
+  // SSH algorithm negotiation. Ordering is implementation-specific and
+  // fingerprints the client library better than the banner alone, which is
+  // trivially spoofed.
+  repeated string kex_algorithms         = 4;
+  repeated string ciphers                = 5;
+  repeated string macs                   = 6;
+  repeated string compression_algorithms = 7;
+
+  // HASSH fingerprint (MD5 over the joined algorithm lists). Stable across
+  // banner spoofing, so it clusters bot families that rotate their banners.
+  string hassh = 8;
+}
+
+enum SessionEndReason {
+  SESSION_END_REASON_UNSPECIFIED    = 0;
+  SESSION_END_REASON_CLIENT_CLOSED  = 1;
+  SESSION_END_REASON_TIMEOUT        = 2;
+  SESSION_END_REASON_LIMIT_EXCEEDED = 3;
+  SESSION_END_REASON_NODE_SHUTDOWN  = 4;
+  SESSION_END_REASON_PROTOCOL_ERROR = 5;
+}
+
+message SessionEnd {
+  SessionEndReason          reason         = 1;
+  google.protobuf.Duration  duration       = 2;
+  uint32                    command_count  = 3;
+  uint32                    auth_attempts  = 4;
+  uint64                    bytes_in       = 5;
+  uint64                    bytes_out      = 6;
+
+  // SHA-256 of the PCAP for this session, if capture was enabled. The bytes
+  // live in the object store under this key.
+  string pcap_sha256 = 7;
+}
+
+enum AuthMethod {
+  AUTH_METHOD_UNSPECIFIED = 0;
+  AUTH_METHOD_PASSWORD    = 1;
+  AUTH_METHOD_PUBLICKEY   = 2;
+  AUTH_METHOD_KEYBOARD    = 3;
+  AUTH_METHOD_NONE        = 4;
+}
+
+message AuthAttempt {
+  AuthMethod method   = 1;
+  string     username = 2;
+
+  // Stored verbatim. The exact bytes -- including typos, encoding quirks, and
+  // trailing whitespace -- are the signal that links a session to a specific
+  // wordlist. Redaction happens at the publish boundary, not here.
+  string password = 3;
+
+  // For publickey attempts: SHA-256 of the offered public key blob, plus its
+  // type. Reused keys across sessions are a strong actor link.
+  string public_key_sha256 = 4;
+  string public_key_type   = 5;
+
+  bool success = 6;
+
+  // Index of this attempt within the session, from 0. Combined with the
+  // timestamps this yields the credential-spray rate.
+  uint32 attempt_index = 7;
+
+  // Time since the previous auth attempt in this session. Scripted sprays are
+  // near-constant; humans are not.
+  google.protobuf.Duration since_previous = 8;
+}
+
+message CommandInput {
+  // Exactly what the client sent, before any parsing. Never interpreted as a
+  // command to run -- the node has no execution path.
+  string raw = 1;
+
+  // Best-effort tokenisation for feature extraction. Parse failures leave this
+  // empty and set `parse_failed`; the raw line is still recorded.
+  repeated string argv        = 2;
+  bool            parse_failed = 3;
+
+  // Emulated working directory at the time of input.
+  string cwd = 4;
+
+  // Time since session start, and since the previous command.
+  google.protobuf.Duration since_session_start = 5;
+  google.protobuf.Duration since_previous      = 6;
+
+  // Per-keystroke inter-arrival times in milliseconds, when the session is
+  // interactive (PTY allocated). This is the single best bot/human
+  // discriminator: humans produce lognormal-ish gaps with pauses at word
+  // boundaries, scripts paste whole lines in one read.
+  repeated uint32 keystroke_deltas_ms = 7;
+
+  // True when the whole line arrived in a single read -- i.e. pasted or piped
+  // rather than typed.
+  bool bulk_input = 8;
+
+  // Sequence index within the session.
+  uint32 command_index = 9;
+}
+
+// ArtifactReference records a remote resource an attacker *told the node to
+// fetch*. The node does not fetch it. See design doc section 4.2 -- fetching
+// attacker-supplied URLs from the sensor is how honeypots become malware
+// distribution hosts.
+message ArtifactReference {
+  string url        = 1;
+  string scheme     = 2;
+  string host       = 3;
+  uint32 port       = 4;
+  string path       = 5;
+
+  // The command that referenced it, e.g. "wget" / "curl" / "tftp".
+  string via_tool = 6;
+
+  // Raw command line the URL was extracted from, for context.
+  string source_command = 7;
+}
+
+// FileUpload is content the attacker actually pushed to the node over the wire
+// (SCP, SFTP, an HTTP POST body). Unlike ArtifactReference this is bytes we
+// genuinely hold, stored content-addressed in the object store.
+message FileUpload {
+  string sha256       = 1;
+  uint64 size_bytes   = 2;
+  string claimed_name = 3;
+  string transport    = 4;  // "scp" | "sftp" | "http-post" | "raw"
+
+  // First bytes, for quick triage without pulling the whole object.
+  bytes  magic_prefix = 5;
+  string detected_type = 6;
+}
+
+message HttpRequest {
+  string method = 1;
+  string path   = 2;
+  string query  = 3;
+  string version = 4;
+
+  map<string, string> headers = 5;
+
+  string body_sha256 = 6;
+  uint64 body_size   = 7;
+
+  // Which decoy template served this, e.g. "phpmyadmin" | "struts2" | "generic".
+  string decoy_profile = 8;
+
+  // Status the decoy returned.
+  uint32 response_status = 9;
+
+  // Exploit classes recognised in the request, e.g. "log4shell" | "sqli" |
+  // "path-traversal". Extracted at the sensor because the raw request is
+  // bulky and the classification is cheap; the collector keeps both so a rule
+  // change can be re-run against stored requests.
+  repeated string detected_attacks = 10;
+
+  // Credentials submitted to a decoy login form. Kept separate from the header
+  // map so they inherit the same handling as SSH credentials rather than
+  // sitting in a generic bag of strings.
+  string form_username = 11;
+  string form_password = 12;
+}
+
+message RdpConnect {
+  // mstshash cookie from the X.224 Connection Request. Frequently contains the
+  // attacker's own hostname or the target username from their tooling.
+  string cookie = 1;
+
+  // Credentials recovered from the CredSSP/NLA exchange, when the client
+  // offered them before the handshake was abandoned.
+  string domain   = 2;
+  string username = 3;
+  string password = 4;
+
+  string client_build   = 5;
+  string client_name    = 6;
+  repeated string requested_protocols = 7;
+}
+
+message CanaryTrigger {
+  // Identifier baked into the honeyfile at generation time.
+  string token_id = 1;
+
+  // What kind of decoy fired: "docx-callback" | "aws-key" | "dns-token" |
+  // "url-token".
+  string token_type = 2;
+
+  // Where the honeyfile was planted, so an alert can name the compromised path.
+  string planted_path = 3;
+
+  // Callback source, which may differ from any session peer -- that difference
+  // is the interesting part, since it shows exfiltration to a second host.
+  Peer   callback_peer = 4;
+  string user_agent    = 5;
+}
+
+message NodeHeartbeat {
+  google.protobuf.Duration uptime = 1;
+
+  // Events dropped by the WAL spool since last heartbeat because the bound was
+  // hit. Non-zero means the corpus has holes and the operator must know.
+  uint64 spool_dropped = 2;
+  uint64 spool_depth   = 3;
+
+  uint32 active_sessions = 4;
+  string build_version   = 5;
+}
+
+// NodeAnomaly is the node reporting something wrong with itself: a protocol
+// handler panic recovered, a rate limit engaged, a malformed frame. Surfaced
+// because a node that starts behaving oddly may be under active exploitation.
+message NodeAnomaly {
+  string kind    = 1;
+  string detail  = 2;
+  Peer   peer    = 3;
+}

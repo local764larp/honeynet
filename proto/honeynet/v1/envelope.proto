@@ -1,0 +1,53 @@
+syntax = "proto3";
+
+package honeynet.v1;
+
+import "google/protobuf/timestamp.proto";
+import "honeynet/v1/events.proto";
+
+option go_package = "github.com/honeynet/node/gen/honeynet/v1;honeynetv1";
+
+// Envelope is the only message ever published on the wire by a node.
+//
+// Trust model: every field in this message originates on a node, and nodes are
+// internet-exposed and assumed compromisable. The collector treats all of it as
+// untrusted input. In particular `ts_node` is advisory only -- node clocks are
+// attacker-adjacent -- and the collector stamps its own receive time for any
+// cross-node ordering.
+message Envelope {
+  // Stable node identity. Must match the CN of the client certificate the node
+  // authenticated with; the collector rejects mismatches rather than trusting
+  // the self-reported value.
+  string node_id = 1;
+
+  // Per-node monotonic counter starting at 1, persisted in the WAL spool so it
+  // survives restart. Gaps mean lost events; repeats mean replay. Both are
+  // recorded as collector-side anomalies rather than silently accepted.
+  uint64 seq = 2;
+
+  // Node-local observation time. Advisory.
+  google.protobuf.Timestamp ts_node = 3;
+
+  // ULID, generated node-side at session open. Groups all events belonging to
+  // one attacker interaction. Lexicographically sortable by creation time.
+  string session_id = 4;
+
+  // Schema version of the event body, bumped only on breaking changes that
+  // `buf breaking` cannot express. Lets the collector reject or quarantine
+  // events from nodes running an incompatible build.
+  uint32 schema_version = 5;
+
+  oneof event {
+    SessionStart        session_start        = 10;
+    SessionEnd          session_end          = 11;
+    AuthAttempt         auth_attempt         = 12;
+    CommandInput        command_input        = 13;
+    ArtifactReference   artifact_reference   = 14;
+    FileUpload          file_upload          = 15;
+    HttpRequest         http_request         = 16;
+    RdpConnect          rdp_connect          = 17;
+    CanaryTrigger       canary_trigger       = 18;
+    NodeHeartbeat       node_heartbeat       = 19;
+    NodeAnomaly         node_anomaly         = 20;
+  }
+}
